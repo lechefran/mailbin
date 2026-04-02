@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"net"
 	"strings"
 	"testing"
 	"time"
@@ -66,20 +67,24 @@ func TestAppReadByRange(t *testing.T) {
 	}
 }
 
-func TestAppRunActionByRange(t *testing.T) {
+func TestAppRunAction(t *testing.T) {
 	now := time.Date(2026, time.April, 1, 15, 30, 0, 0, time.UTC)
 	expected := []EmailSummary{{UID: 1, Subject: "sample"}}
 
 	testCases := []struct {
-		name          string
-		action        string
-		rangeValue    string
-		wantMethod    string
-		wantErrorText string
+		name           string
+		action         string
+		rangeValue     string
+		age            int
+		includeFlagged bool
+		wantMethod     string
+		wantErrorText  string
 	}{
 		{name: "default read", action: "", rangeValue: "all", wantMethod: "read-all"},
 		{name: "read today", action: "read", rangeValue: "today", wantMethod: "read-today"},
-		{name: "delete month", action: "delete", rangeValue: "month", wantMethod: "delete-month"},
+		{name: "delete by age", action: "delete", age: 90, wantMethod: "delete-age"},
+		{name: "delete flagged by age", action: "delete", age: 90, includeFlagged: true, wantMethod: "delete-age"},
+		{name: "delete missing age", action: "delete", age: -1, wantErrorText: "age is required for delete action"},
 		{name: "invalid action", action: "destroy", rangeValue: "all", wantErrorText: `invalid action "destroy"`},
 	}
 
@@ -92,29 +97,37 @@ func TestAppRunActionByRange(t *testing.T) {
 			}
 
 			app := &App{
-				Action: testCase.action,
-				Range:  testCase.rangeValue,
+				Action:         testCase.action,
+				Age:            testCase.age,
+				IncludeFlagged: testCase.includeFlagged,
+				Range:          testCase.rangeValue,
 				Now: func() time.Time {
 					return now
 				},
 			}
 
-			emails, err := app.runActionByRange(session)
+			emails, err := app.runAction(session)
 			if testCase.wantErrorText != "" {
 				if err == nil || !strings.Contains(err.Error(), testCase.wantErrorText) {
-					t.Fatalf("runActionByRange() error = %v, want %q", err, testCase.wantErrorText)
+					t.Fatalf("runAction() error = %v, want %q", err, testCase.wantErrorText)
 				}
 				return
 			}
 
 			if err != nil {
-				t.Fatalf("runActionByRange() error = %v", err)
+				t.Fatalf("runAction() error = %v", err)
 			}
 			if len(emails) != 1 || emails[0].UID != expected[0].UID {
-				t.Fatalf("runActionByRange() emails = %v, want %v", emails, expected)
+				t.Fatalf("runAction() emails = %v, want %v", emails, expected)
 			}
 			if session.called != testCase.wantMethod {
 				t.Fatalf("session called %q, want %q", session.called, testCase.wantMethod)
+			}
+			if testCase.wantMethod == "delete-age" && session.calledAge != testCase.age {
+				t.Fatalf("session calledAge = %d, want %d", session.calledAge, testCase.age)
+			}
+			if testCase.wantMethod == "delete-age" && session.calledIncludeFlagged != testCase.includeFlagged {
+				t.Fatalf("session calledIncludeFlagged = %v, want %v", session.calledIncludeFlagged, testCase.includeFlagged)
 			}
 		})
 	}
@@ -212,9 +225,10 @@ func TestAppRunDeletePrintsEmailsAndCount(t *testing.T) {
 		Login: func(context.Context, *IMAPClient) (SessionWithInboxRead, error) {
 			return client.session, nil
 		},
-		Action:  "delete",
-		Range:   "today",
-		Timeout: time.Second,
+		Action:         "delete",
+		Age:            0,
+		IncludeFlagged: false,
+		Timeout:        time.Second,
 		Now: func() time.Time {
 			return time.Date(2026, time.April, 1, 12, 0, 0, 0, time.UTC)
 		},
@@ -235,8 +249,14 @@ func TestAppRunDeletePrintsEmailsAndCount(t *testing.T) {
 	if !strings.Contains(output, "deleted 2 emails") {
 		t.Fatalf("Run() output = %q, want deleted count", output)
 	}
-	if client.session.called != "delete-today" {
-		t.Fatalf("session called %q, want delete-today", client.session.called)
+	if client.session.called != "delete-age" {
+		t.Fatalf("session called %q, want delete-age", client.session.called)
+	}
+	if client.session.calledAge != 0 {
+		t.Fatalf("session calledAge = %d, want 0", client.session.calledAge)
+	}
+	if client.session.calledIncludeFlagged {
+		t.Fatal("session calledIncludeFlagged = true, want false")
 	}
 }
 
@@ -303,6 +323,78 @@ func TestAppRunMultipleAccountsAggregatesOutput(t *testing.T) {
 	}
 }
 
+func TestAppRunDeleteMultipleAccountsRunsConcurrentlyAndAggregatesCount(t *testing.T) {
+	buffer := &bytes.Buffer{}
+	started := make(chan string, 2)
+	release := make(chan struct{})
+	errs := make(chan error, 1)
+
+	app := &App{
+		Accounts: []ConfiguredAccount{
+			{
+				Name: "gmail",
+				Client: &IMAPClient{
+					Address: "imap.gmail.com:993",
+					Email:   "one@example.com",
+				},
+			},
+			{
+				Name: "icloud",
+				Client: &IMAPClient{
+					Address: "imap.mail.me.com:993",
+					Email:   "two@example.com",
+				},
+			},
+		},
+		Login: func(_ context.Context, client *IMAPClient) (SessionWithInboxRead, error) {
+			return &blockingDeleteSession{
+				email:   client.Email,
+				started: started,
+				release: release,
+				emails: []EmailSummary{
+					{
+						UID:     1,
+						Mailbox: "INBOX",
+						Subject: client.Email,
+					},
+				},
+			}, nil
+		},
+		Action:         "delete",
+		Age:            90,
+		IncludeFlagged: false,
+		Concurrency:    2,
+		Timeout:        time.Second,
+		Output:         buffer,
+	}
+
+	go func() {
+		errs <- app.Run(context.Background())
+	}()
+
+	first := <-started
+	second := <-started
+	if first == second {
+		t.Fatalf("started accounts = %q and %q, want distinct concurrent deletes", first, second)
+	}
+	close(release)
+
+	if err := <-errs; err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	output := buffer.String()
+	if !strings.Contains(output, "account=gmail |") {
+		t.Fatalf("Run() output = %q, want gmail account label", output)
+	}
+	if !strings.Contains(output, "account=icloud |") {
+		t.Fatalf("Run() output = %q, want icloud account label", output)
+	}
+	if !strings.Contains(output, "deleted 2 emails") {
+		t.Fatalf("Run() output = %q, want aggregated deleted count", output)
+	}
+}
+
 func TestAppRunDoesNotPrintEmptySummaryWhenAllAccountsFail(t *testing.T) {
 	buffer := &bytes.Buffer{}
 
@@ -340,6 +432,43 @@ func TestAppRunDoesNotPrintEmptySummaryWhenAllAccountsFail(t *testing.T) {
 	}
 	if buffer.Len() != 0 {
 		t.Fatalf("Run() output = %q, want no empty summary", buffer.String())
+	}
+}
+
+func TestAppRunIgnoresLogoutTimeoutAfterSuccessfulDelete(t *testing.T) {
+	buffer := &bytes.Buffer{}
+	app := &App{
+		Client: &IMAPClient{
+			Address: "imap.example.com:993",
+			Email:   "user@example.com",
+		},
+		Login: func(context.Context, *IMAPClient) (SessionWithInboxRead, error) {
+			return &timeoutLogoutSession{
+				stubSession: stubSession{
+					stubInboxReader: stubInboxReader{
+						emails: []EmailSummary{
+							{UID: 1, Subject: "Old message"},
+						},
+					},
+				},
+			}, nil
+		},
+		Action:  "delete",
+		Age:     90,
+		Timeout: time.Second,
+		Output:  buffer,
+	}
+
+	if err := app.Run(context.Background()); err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	output := buffer.String()
+	if !strings.Contains(output, "Old message") {
+		t.Fatalf("Run() output = %q, want deleted message", output)
+	}
+	if !strings.Contains(output, "deleted 1 emails") {
+		t.Fatalf("Run() output = %q, want delete summary", output)
 	}
 }
 
@@ -410,9 +539,11 @@ type stubLoginReader struct {
 }
 
 type stubInboxReader struct {
-	called     string
-	calledWith time.Time
-	emails     []EmailSummary
+	called               string
+	calledWith           time.Time
+	calledAge            int
+	calledIncludeFlagged bool
+	emails               []EmailSummary
 }
 
 func (s *stubInboxReader) ReadInboxAll() ([]EmailSummary, error) {
@@ -438,26 +569,11 @@ func (s *stubInboxReader) ReadInboxThisMonth(now time.Time) ([]EmailSummary, err
 	return s.emails, nil
 }
 
-func (s *stubSession) DeleteInboxAll() ([]EmailSummary, error) {
-	s.called = "delete-all"
-	return s.emails, nil
-}
-
-func (s *stubSession) DeleteInboxToday(now time.Time) ([]EmailSummary, error) {
-	s.called = "delete-today"
+func (s *stubSession) DeleteInboxOlderThanDays(now time.Time, age int, includeFlagged bool) ([]EmailSummary, error) {
+	s.called = "delete-age"
 	s.calledWith = now
-	return s.emails, nil
-}
-
-func (s *stubSession) DeleteInboxThisWeek(now time.Time) ([]EmailSummary, error) {
-	s.called = "delete-week"
-	s.calledWith = now
-	return s.emails, nil
-}
-
-func (s *stubSession) DeleteInboxThisMonth(now time.Time) ([]EmailSummary, error) {
-	s.called = "delete-month"
-	s.calledWith = now
+	s.calledAge = age
+	s.calledIncludeFlagged = includeFlagged
 	return s.emails, nil
 }
 
@@ -467,6 +583,54 @@ type stubSession struct {
 }
 
 func (s *stubSession) Logout() error {
+	s.loggedOut = true
+	return nil
+}
+
+type timeoutLogoutSession struct {
+	stubSession
+}
+
+func (s *timeoutLogoutSession) Logout() error {
+	s.loggedOut = true
+	return &net.DNSError{
+		Err:         "i/o timeout",
+		IsTimeout:   true,
+		IsTemporary: true,
+	}
+}
+
+type blockingDeleteSession struct {
+	email     string
+	started   chan<- string
+	release   <-chan struct{}
+	emails    []EmailSummary
+	loggedOut bool
+}
+
+func (s *blockingDeleteSession) ReadInboxAll() ([]EmailSummary, error) {
+	return nil, nil
+}
+
+func (s *blockingDeleteSession) ReadInboxToday(time.Time) ([]EmailSummary, error) {
+	return nil, nil
+}
+
+func (s *blockingDeleteSession) ReadInboxThisWeek(time.Time) ([]EmailSummary, error) {
+	return nil, nil
+}
+
+func (s *blockingDeleteSession) ReadInboxThisMonth(time.Time) ([]EmailSummary, error) {
+	return nil, nil
+}
+
+func (s *blockingDeleteSession) DeleteInboxOlderThanDays(time.Time, int, bool) ([]EmailSummary, error) {
+	s.started <- s.email
+	<-s.release
+	return s.emails, nil
+}
+
+func (s *blockingDeleteSession) Logout() error {
 	s.loggedOut = true
 	return nil
 }

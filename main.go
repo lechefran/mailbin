@@ -7,22 +7,25 @@ import (
 	"io"
 	"log"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 )
 
 type App struct {
-	Client      *IMAPClient
-	Accounts    []ConfiguredAccount
-	Login       func(context.Context, *IMAPClient) (SessionWithInboxRead, error)
-	Action      string
-	Concurrency int
-	Timeout     time.Duration
-	Range       string
-	Now         func() time.Time
-	Output      io.Writer
-	PrintEmails func(io.Writer, []EmailSummary) error
+	Client         *IMAPClient
+	Accounts       []ConfiguredAccount
+	Login          func(context.Context, *IMAPClient) (SessionWithInboxRead, error)
+	Action         string
+	Age            int
+	IncludeFlagged bool
+	Concurrency    int
+	Timeout        time.Duration
+	Range          string
+	Now            func() time.Time
+	Output         io.Writer
+	PrintEmails    func(io.Writer, []EmailSummary) error
 }
 
 type ConfiguredAccount struct {
@@ -39,10 +42,7 @@ type InboxReader interface {
 
 type SessionWithInboxRead interface {
 	InboxReader
-	DeleteInboxAll() ([]EmailSummary, error)
-	DeleteInboxToday(time.Time) ([]EmailSummary, error)
-	DeleteInboxThisWeek(time.Time) ([]EmailSummary, error)
-	DeleteInboxThisMonth(time.Time) ([]EmailSummary, error)
+	DeleteInboxOlderThanDays(time.Time, int, bool) ([]EmailSummary, error)
 	Logout() error
 }
 
@@ -95,6 +95,7 @@ func (a *App) Run(ctx context.Context) error {
 	limiter := make(chan struct{}, concurrency)
 	var wg sync.WaitGroup
 	for _, account := range accounts {
+		account := account
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -117,7 +118,7 @@ func (a *App) Run(ctx context.Context) error {
 
 			log.Printf("connected to IMAP server %s as %s", account.Client.Address, account.Client.Email)
 
-			emails, err := a.runActionByRange(session)
+			emails, err := a.runAction(session)
 			logoutErr := session.Logout()
 			if err != nil {
 				results <- accountRunResult{
@@ -125,6 +126,12 @@ func (a *App) Run(ctx context.Context) error {
 					err:         err,
 				}
 				return
+			}
+			if logoutErr != nil {
+				if isTimeoutError(logoutErr) {
+					log.Printf("ignoring logout timeout for account %s: %v", account.Name, logoutErr)
+					logoutErr = nil
+				}
 			}
 			if logoutErr != nil {
 				results <- accountRunResult{
@@ -199,8 +206,22 @@ func newAppFromFlags() (*App, error) {
 	address := flag.String("imap-addr", envOrDefault("MAILBIN_IMAP_ADDR", ""), "IMAP server address in host:port format")
 	email := flag.String("email", envOrDefault("MAILBIN_EMAIL", ""), "email address used for IMAP login")
 	emailRange := flag.String("range", envOrDefault("MAILBIN_RANGE", "all"), "email range to read: all, today, week, or month")
+	ageDefault, err := envIntOrDefault("MAILBIN_AGE", -1)
+	if err != nil {
+		return nil, err
+	}
+	age := flag.Int("age", ageDefault, "minimum email age in days for delete action")
+	includeFlagged := flag.Bool(
+		"include-flagged",
+		envBoolOrDefault("MAILBIN_INCLUDE_FLAGGED", false),
+		"include flagged/starred emails in delete action",
+	)
 	timeout := flag.Duration("timeout", 15*time.Second, "connection timeout")
 	flag.Parse()
+
+	if *action == "delete" && *age < 0 {
+		return nil, fmt.Errorf("age is required for delete action and must be 0 or greater")
+	}
 
 	if *configPath == "" {
 		password, err := resolvePassword(os.Stdin, os.Stderr, os.Getenv, stdinIsInteractive())
@@ -219,12 +240,14 @@ func newAppFromFlags() (*App, error) {
 		}
 
 		return &App{
-			Client:  client,
-			Action:  *action,
-			Timeout: *timeout,
-			Range:   *emailRange,
-			Now:     time.Now,
-			Output:  os.Stdout,
+			Client:         client,
+			Action:         *action,
+			Age:            *age,
+			IncludeFlagged: *includeFlagged,
+			Timeout:        *timeout,
+			Range:          *emailRange,
+			Now:            time.Now,
+			Output:         os.Stdout,
 		}, nil
 	}
 
@@ -234,12 +257,14 @@ func newAppFromFlags() (*App, error) {
 	}
 
 	return &App{
-		Accounts: accounts,
-		Action:   *action,
-		Timeout:  *timeout,
-		Range:    *emailRange,
-		Now:      time.Now,
-		Output:   os.Stdout,
+		Accounts:       accounts,
+		Action:         *action,
+		Age:            *age,
+		IncludeFlagged: *includeFlagged,
+		Timeout:        *timeout,
+		Range:          *emailRange,
+		Now:            time.Now,
+		Output:         os.Stdout,
 	}, nil
 }
 
@@ -264,12 +289,12 @@ func stdinIsInteractive() bool {
 	return info.Mode()&os.ModeCharDevice != 0
 }
 
-func (a *App) runActionByRange(session SessionWithInboxRead) ([]EmailSummary, error) {
+func (a *App) runAction(session SessionWithInboxRead) ([]EmailSummary, error) {
 	switch a.Action {
 	case "", "read":
 		return a.readByRange(session)
 	case "delete":
-		return a.deleteByRange(session)
+		return a.deleteByAge(session)
 	default:
 		return nil, fmt.Errorf("invalid action %q: must be read or delete", a.Action)
 	}
@@ -311,24 +336,17 @@ func (a *App) readByRange(session InboxReader) ([]EmailSummary, error) {
 	}
 }
 
-func (a *App) deleteByRange(session SessionWithInboxRead) ([]EmailSummary, error) {
+func (a *App) deleteByAge(session SessionWithInboxRead) ([]EmailSummary, error) {
+	if a.Age < 0 {
+		return nil, fmt.Errorf("age is required for delete action and must be 0 or greater")
+	}
+
 	now := time.Now
 	if a.Now != nil {
 		now = a.Now
 	}
 
-	switch a.Range {
-	case "", "all":
-		return session.DeleteInboxAll()
-	case "today":
-		return session.DeleteInboxToday(now())
-	case "week":
-		return session.DeleteInboxThisWeek(now())
-	case "month":
-		return session.DeleteInboxThisMonth(now())
-	default:
-		return nil, fmt.Errorf("invalid range %q: must be one of all, today, week, or month", a.Range)
-	}
+	return session.DeleteInboxOlderThanDays(now(), a.Age, a.IncludeFlagged)
 }
 
 func writeEmailSummaries(output io.Writer, emails []EmailSummary) error {
@@ -383,4 +401,32 @@ func envOrDefault(key, fallback string) string {
 	}
 
 	return value
+}
+
+func envIntOrDefault(key string, fallback int) (int, error) {
+	value := strings.TrimSpace(os.Getenv(key))
+	if value == "" {
+		return fallback, nil
+	}
+
+	parsed, err := strconv.Atoi(value)
+	if err != nil {
+		return 0, fmt.Errorf("%s must be an integer: %w", key, err)
+	}
+
+	return parsed, nil
+}
+
+func envBoolOrDefault(key string, fallback bool) bool {
+	value := strings.TrimSpace(os.Getenv(key))
+	if value == "" {
+		return fallback
+	}
+
+	parsed, err := strconv.ParseBool(value)
+	if err != nil {
+		return fallback
+	}
+
+	return parsed
 }

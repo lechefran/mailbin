@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/mail"
 	"sort"
@@ -57,6 +58,8 @@ type IMAPSession struct {
 	writer         *bufio.Writer
 	nextTag        int
 	commandTimeout time.Duration
+	timedOut       bool
+	client         *IMAPClient
 }
 
 type EmailSummary struct {
@@ -82,6 +85,8 @@ type mailboxSearchResult struct {
 }
 
 const maxDeletePasses = 5
+
+var fetchBatchSize = 100
 
 func resolveIMAPAddress(provider string, address string) (string, error) {
 	address = strings.TrimSpace(address)
@@ -135,6 +140,7 @@ func (c *IMAPClient) Login(ctx context.Context) (*IMAPSession, error) {
 		reader:  bufio.NewReader(conn),
 		writer:  bufio.NewWriter(conn),
 		nextTag: 1,
+		client:  c,
 	}
 
 	if deadline, ok := ctx.Deadline(); ok {
@@ -220,28 +226,21 @@ func (s *IMAPSession) ReadInboxThisMonth(now time.Time) ([]EmailSummary, error) 
 	return s.readInboxSince(startOfDay(now.AddDate(0, 0, -30)))
 }
 
-func (s *IMAPSession) DeleteInboxAll() ([]EmailSummary, error) {
-	return s.deleteInboxByCriteria("ALL")
-}
-
-func (s *IMAPSession) DeleteInboxToday(now time.Time) ([]EmailSummary, error) {
-	return s.deleteInboxSince(startOfDay(now))
-}
-
-func (s *IMAPSession) DeleteInboxThisWeek(now time.Time) ([]EmailSummary, error) {
-	return s.deleteInboxSince(startOfDay(now.AddDate(0, 0, -7)))
-}
-
-func (s *IMAPSession) DeleteInboxThisMonth(now time.Time) ([]EmailSummary, error) {
-	return s.deleteInboxSince(startOfDay(now.AddDate(0, 0, -30)))
-}
-
 func (s *IMAPSession) readInboxSince(since time.Time) ([]EmailSummary, error) {
 	return s.readInboxByCriteria("SINCE %s", formatIMAPDate(since))
 }
 
-func (s *IMAPSession) deleteInboxSince(since time.Time) ([]EmailSummary, error) {
-	return s.deleteInboxByCriteria("SINCE %s", formatIMAPDate(since))
+func (s *IMAPSession) DeleteInboxOlderThanDays(now time.Time, days int, includeFlagged bool) ([]EmailSummary, error) {
+	if days < 0 {
+		return nil, fmt.Errorf("age must be 0 or greater")
+	}
+
+	cutoff := startOfDay(now.AddDate(0, 0, -days)).AddDate(0, 0, 1)
+	if includeFlagged {
+		return s.deleteInboxByCriteria("BEFORE %s", formatIMAPDate(cutoff))
+	}
+
+	return s.deleteInboxByCriteria("BEFORE %s UNFLAGGED", formatIMAPDate(cutoff))
 }
 
 func (s *IMAPSession) readInboxByCriteria(format string, args ...any) ([]EmailSummary, error) {
@@ -257,6 +256,7 @@ func (s *IMAPSession) deleteInboxByCriteria(format string, args ...any) ([]Email
 	var deletedSummaries []EmailSummary
 	var firstErr error
 
+deletePasses:
 	for pass := 0; pass < maxDeletePasses; pass++ {
 		results, err := s.searchMailboxes(format, args...)
 		if err != nil {
@@ -264,6 +264,15 @@ func (s *IMAPSession) deleteInboxByCriteria(format string, args ...any) ([]Email
 				firstErr = err
 			}
 			break
+		}
+		if s.timedOut {
+			log.Printf("reconnecting IMAP session after timeout during delete search")
+			if err := s.reconnect(); err != nil {
+				if firstErr == nil {
+					firstErr = err
+				}
+				break
+			}
 		}
 
 		passDeletedCount := 0
@@ -273,6 +282,19 @@ func (s *IMAPSession) deleteInboxByCriteria(format string, args ...any) ([]Email
 			}
 
 			if err := s.deleteMailboxMessages(result.mailbox, result.summaries); err != nil {
+				if isTimeoutError(err) {
+					log.Printf("skipping mailbox %s after timeout during delete: %v", result.mailbox, err)
+					if reconnectErr := s.reconnect(); reconnectErr != nil {
+						if firstErr == nil && len(deletedSummaries) == 0 {
+							firstErr = reconnectErr
+						}
+						break deletePasses
+					}
+					if len(deletedSummaries) > 0 {
+						continue
+					}
+					continue
+				}
 				if firstErr == nil {
 					firstErr = err
 				}
@@ -306,6 +328,14 @@ func (s *IMAPSession) searchMailboxes(format string, args ...any) ([]mailboxSear
 	successfulMailboxReads := 0
 	for _, mailbox := range mailboxes {
 		if err := s.selectMailbox(mailbox); err != nil {
+			if isTimeoutError(err) {
+				s.timedOut = true
+				if successfulMailboxReads > 0 {
+					log.Printf("stopping mailbox scan after timeout selecting %s: %v", mailbox, err)
+					break
+				}
+				return nil, err
+			}
 			if firstErr == nil {
 				firstErr = err
 			}
@@ -314,6 +344,14 @@ func (s *IMAPSession) searchMailboxes(format string, args ...any) ([]mailboxSear
 
 		sequenceNumbers, err := s.search(format, args...)
 		if err != nil {
+			if isTimeoutError(err) {
+				s.timedOut = true
+				if successfulMailboxReads > 0 {
+					log.Printf("stopping mailbox scan after timeout searching %s: %v", mailbox, err)
+					break
+				}
+				return nil, fmt.Errorf("search mailbox %s: %w", mailbox, err)
+			}
 			if firstErr == nil {
 				firstErr = fmt.Errorf("search mailbox %s: %w", mailbox, err)
 			}
@@ -322,6 +360,14 @@ func (s *IMAPSession) searchMailboxes(format string, args ...any) ([]mailboxSear
 
 		mailboxSummaries, err := s.fetchEmailSummaries(mailbox, sequenceNumbers)
 		if err != nil {
+			if isTimeoutError(err) {
+				s.timedOut = true
+				if successfulMailboxReads > 0 {
+					log.Printf("stopping mailbox scan after timeout fetching %s: %v", mailbox, err)
+					break
+				}
+				return nil, fmt.Errorf("fetch mailbox %s: %w", mailbox, err)
+			}
 			if firstErr == nil {
 				firstErr = fmt.Errorf("fetch mailbox %s: %w", mailbox, err)
 			}
@@ -451,6 +497,36 @@ func (s *IMAPSession) fetchEmailSummaries(mailbox string, sequenceNumbers []int)
 		return nil, nil
 	}
 
+	summaries := make([]EmailSummary, 0, len(sequenceNumbers))
+	for start := 0; start < len(sequenceNumbers); start += fetchBatchSize {
+		end := start + fetchBatchSize
+		if end > len(sequenceNumbers) {
+			end = len(sequenceNumbers)
+		}
+
+		batchSummaries, err := s.fetchEmailSummaryBatch(mailbox, sequenceNumbers[start:end])
+		if err != nil && isTimeoutError(err) && s.client != nil {
+			log.Printf("retrying fetch for mailbox %s after timeout", mailbox)
+			if reconnectErr := s.reconnect(); reconnectErr != nil {
+				return nil, fmt.Errorf("fetch email summaries: %w", reconnectErr)
+			}
+			if err := s.selectMailbox(mailbox); err != nil {
+				return nil, fmt.Errorf("fetch email summaries: %w", err)
+			}
+
+			batchSummaries, err = s.fetchEmailSummaryBatch(mailbox, sequenceNumbers[start:end])
+		}
+		if err != nil {
+			return nil, fmt.Errorf("fetch email summaries: %w", err)
+		}
+
+		summaries = append(summaries, batchSummaries...)
+	}
+
+	return summaries, nil
+}
+
+func (s *IMAPSession) fetchEmailSummaryBatch(mailbox string, sequenceNumbers []int) ([]EmailSummary, error) {
 	values := make([]string, 0, len(sequenceNumbers))
 	for _, sequenceNumber := range sequenceNumbers {
 		values = append(values, strconv.Itoa(sequenceNumber))
@@ -461,7 +537,7 @@ func (s *IMAPSession) fetchEmailSummaries(mailbox string, sequenceNumbers []int)
 		strings.Join(values, ","),
 	)
 	if err != nil {
-		return nil, fmt.Errorf("fetch email summaries: %w", err)
+		return nil, err
 	}
 
 	summaries := make([]EmailSummary, 0, len(sequenceNumbers))
@@ -845,4 +921,45 @@ func isSpamMailbox(mailbox string) bool {
 
 func isTrashMailbox(mailbox string) bool {
 	return strings.Contains(mailbox, "trash") || strings.Contains(mailbox, "bin")
+}
+
+func isTimeoutError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return true
+	}
+
+	return strings.Contains(strings.ToLower(err.Error()), "i/o timeout")
+}
+
+func (s *IMAPSession) reconnect() error {
+	if s == nil || s.client == nil {
+		return fmt.Errorf("imap client is required for reconnect")
+	}
+	if s.conn != nil {
+		_ = s.conn.Close()
+		s.conn = nil
+	}
+
+	ctx := context.Background()
+	cancel := func() {}
+	if s.commandTimeout > 0 {
+		ctx, cancel = context.WithTimeout(ctx, s.commandTimeout)
+	}
+	defer cancel()
+
+	reconnected, err := s.client.Login(ctx)
+	if err != nil {
+		return err
+	}
+
+	*s = *reconnected
+	return nil
 }
