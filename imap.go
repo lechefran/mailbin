@@ -52,13 +52,15 @@ type IMAPClient struct {
 }
 
 type IMAPSession struct {
-	conn    net.Conn
-	reader  *bufio.Reader
-	writer  *bufio.Writer
-	nextTag int
+	conn           net.Conn
+	reader         *bufio.Reader
+	writer         *bufio.Writer
+	nextTag        int
+	commandTimeout time.Duration
 }
 
 type EmailSummary struct {
+	Account        string
 	Mailbox        string
 	MessageID      string
 	SequenceNumber int
@@ -136,10 +138,7 @@ func (c *IMAPClient) Login(ctx context.Context) (*IMAPSession, error) {
 	}
 
 	if deadline, ok := ctx.Deadline(); ok {
-		if err := conn.SetDeadline(deadline); err != nil {
-			conn.Close()
-			return nil, fmt.Errorf("set connection deadline: %w", err)
-		}
+		session.commandTimeout = time.Until(deadline)
 	}
 
 	if err := session.expectGreeting(); err != nil {
@@ -482,6 +481,10 @@ func (s *IMAPSession) fetchEmailSummaries(mailbox string, sequenceNumbers []int)
 }
 
 func (s *IMAPSession) runCommand(format string, args ...any) ([]imapResponseLine, string, error) {
+	if err := s.applyCommandDeadline(); err != nil {
+		return nil, "", err
+	}
+
 	tag := fmt.Sprintf("A%04d", s.nextTag)
 	s.nextTag++
 
@@ -497,12 +500,30 @@ func (s *IMAPSession) runCommand(format string, args ...any) ([]imapResponseLine
 }
 
 func (s *IMAPSession) expectGreeting() error {
+	if err := s.applyCommandDeadline(); err != nil {
+		return err
+	}
+
 	line, err := s.readLine()
 	if err != nil {
 		return fmt.Errorf("read server greeting: %w", err)
 	}
 	if !strings.HasPrefix(strings.ToUpper(line), "* OK") {
 		return fmt.Errorf("unexpected server greeting: %s", line)
+	}
+
+	return nil
+}
+
+func (s *IMAPSession) applyCommandDeadline() error {
+	if s == nil || s.conn == nil {
+		return nil
+	}
+	if s.commandTimeout <= 0 {
+		return nil
+	}
+	if err := s.conn.SetDeadline(time.Now().Add(s.commandTimeout)); err != nil {
+		return fmt.Errorf("set connection deadline: %w", err)
 	}
 
 	return nil

@@ -356,6 +356,56 @@ func TestIMAPSessionReadInboxAllHonorsDeadline(t *testing.T) {
 	}
 }
 
+func TestIMAPSessionReadInboxAllResetsDeadlinePerCommand(t *testing.T) {
+	server := newFakeIMAPServer(t, fakeIMAPServerConfig{
+		email:       "user@example.com",
+		password:    "correct-password",
+		accept:      true,
+		stallList:   90 * time.Millisecond,
+		stallSearch: 90 * time.Millisecond,
+		mailboxes: []fakeIMAPMailbox{
+			{
+				Name: "INBOX",
+				Messages: []fakeIMAPMessage{
+					{
+						UID:        101,
+						MessageID:  "<today@example.com>",
+						ReceivedAt: time.Date(2026, time.April, 1, 8, 0, 0, 0, time.UTC),
+						Subject:    "Today message",
+						From:       "alerts@example.com",
+						To:         "user@example.com",
+					},
+				},
+			},
+		},
+	})
+	t.Cleanup(server.Close)
+
+	client := &IMAPClient{
+		Address:   server.Address(),
+		Email:     "user@example.com",
+		Password:  "correct-password",
+		TLSConfig: server.ClientTLSConfig(),
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+	defer cancel()
+
+	session, err := client.Login(ctx)
+	if err != nil {
+		t.Fatalf("Login() error = %v", err)
+	}
+	defer session.Logout()
+
+	emails, err := session.ReadInboxAll()
+	if err != nil {
+		t.Fatalf("ReadInboxAll() error = %v", err)
+	}
+	if len(emails) != 1 {
+		t.Fatalf("ReadInboxAll() emails = %v, want 1 email", emails)
+	}
+}
+
 func TestIMAPSessionDeleteInboxThisMonth(t *testing.T) {
 	now := time.Date(2026, time.April, 1, 15, 30, 0, 0, time.UTC)
 	server := newFakeIMAPServer(t, fakeIMAPServerConfig{
@@ -510,22 +560,24 @@ func TestIMAPSessionDeleteInboxTodayRescansMovedTrashCopies(t *testing.T) {
 }
 
 type fakeIMAPServer struct {
-	listener  net.Listener
-	config    *tls.Config
-	email     string
-	password  string
-	accept    bool
-	mailboxes []fakeIMAPMailbox
-	selected  string
-	stallList time.Duration
+	listener    net.Listener
+	config      *tls.Config
+	email       string
+	password    string
+	accept      bool
+	mailboxes   []fakeIMAPMailbox
+	selected    string
+	stallList   time.Duration
+	stallSearch time.Duration
 }
 
 type fakeIMAPServerConfig struct {
-	email     string
-	password  string
-	accept    bool
-	mailboxes []fakeIMAPMailbox
-	stallList time.Duration
+	email       string
+	password    string
+	accept      bool
+	mailboxes   []fakeIMAPMailbox
+	stallList   time.Duration
+	stallSearch time.Duration
 }
 
 type fakeIMAPMailbox struct {
@@ -568,11 +620,12 @@ func newFakeIMAPServer(t *testing.T, config fakeIMAPServerConfig) *fakeIMAPServe
 			ServerName: "localhost",
 			MinVersion: tls.VersionTLS12,
 		},
-		email:     config.email,
-		password:  config.password,
-		accept:    config.accept,
-		mailboxes: config.mailboxes,
-		stallList: config.stallList,
+		email:       config.email,
+		password:    config.password,
+		accept:      config.accept,
+		mailboxes:   config.mailboxes,
+		stallList:   config.stallList,
+		stallSearch: config.stallSearch,
 	}
 
 	go server.serve(t)
@@ -651,7 +704,6 @@ func (s *fakeIMAPServer) serve(t *testing.T) {
 		case "LIST":
 			if s.stallList > 0 {
 				time.Sleep(s.stallList)
-				return
 			}
 			if err := s.writeListResponse(writer, tag); err != nil {
 				t.Logf("writeListResponse() error = %v", err)
@@ -681,6 +733,9 @@ func (s *fakeIMAPServer) serve(t *testing.T) {
 				return
 			}
 		case "SEARCH":
+			if s.stallSearch > 0 {
+				time.Sleep(s.stallSearch)
+			}
 			sequenceNumbers, err := s.searchMessages(s.selected, args)
 			if err != nil {
 				if _, writeErr := fmt.Fprintf(writer, "%s NO %s\r\n", tag, err); writeErr != nil {

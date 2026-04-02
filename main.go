@@ -8,6 +8,7 @@ import (
 	"log"
 	"os"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -16,6 +17,7 @@ type App struct {
 	Accounts    []ConfiguredAccount
 	Login       func(context.Context, *IMAPClient) (SessionWithInboxRead, error)
 	Action      string
+	Concurrency int
 	Timeout     time.Duration
 	Range       string
 	Now         func() time.Time
@@ -76,48 +78,99 @@ func (a *App) Run(ctx context.Context) error {
 		printEmails = writeEmailSummaries
 	}
 
-	var failures []string
-	for index, account := range accounts {
-		runCtx, cancel := context.WithTimeout(ctx, timeout)
-		session, err := login(runCtx, account.Client)
-		cancel()
-		if err != nil {
-			failures = append(failures, fmt.Sprintf("%s: %v", account.Name, err))
-			continue
-		}
+	type accountRunResult struct {
+		accountName string
+		emails      []EmailSummary
+		err         error
+	}
 
-		log.Printf("connected to IMAP server %s as %s", account.Client.Address, account.Client.Email)
+	results := make(chan accountRunResult, len(accounts))
+	concurrency := a.Concurrency
+	if concurrency <= 0 || concurrency > len(accounts) {
+		concurrency = len(accounts)
+	}
+	if concurrency > 4 {
+		concurrency = 4
+	}
+	limiter := make(chan struct{}, concurrency)
+	var wg sync.WaitGroup
+	for _, account := range accounts {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			limiter <- struct{}{}
+			defer func() {
+				<-limiter
+			}()
 
-		if len(accounts) > 1 {
-			if index > 0 {
-				if _, err := fmt.Fprintln(output); err != nil {
-					_ = session.Logout()
-					return err
+			runCtx, cancel := context.WithTimeout(ctx, timeout)
+			defer cancel()
+
+			session, err := login(runCtx, account.Client)
+			if err != nil {
+				results <- accountRunResult{
+					accountName: account.Name,
+					err:         err,
+				}
+				return
+			}
+
+			log.Printf("connected to IMAP server %s as %s", account.Client.Address, account.Client.Email)
+
+			emails, err := a.runActionByRange(session)
+			logoutErr := session.Logout()
+			if err != nil {
+				results <- accountRunResult{
+					accountName: account.Name,
+					err:         err,
+				}
+				return
+			}
+			if logoutErr != nil {
+				results <- accountRunResult{
+					accountName: account.Name,
+					err:         logoutErr,
+				}
+				return
+			}
+
+			if len(accounts) > 1 {
+				for index := range emails {
+					emails[index].Account = account.Name
 				}
 			}
-			if _, err := fmt.Fprintf(output, "account=%s email=%s\n", account.Name, account.Client.Email); err != nil {
-				_ = session.Logout()
-				return err
+
+			results <- accountRunResult{
+				accountName: account.Name,
+				emails:      emails,
 			}
-		}
+		}()
+	}
 
-		emails, err := a.runActionByRange(session)
-		logoutErr := session.Logout()
-		if err != nil {
-			failures = append(failures, fmt.Sprintf("%s: %v", account.Name, err))
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+
+	var allEmails []EmailSummary
+	var failures []string
+	for result := range results {
+		if result.err != nil {
+			failures = append(failures, fmt.Sprintf("%s: %v", result.accountName, result.err))
 			continue
 		}
-		if logoutErr != nil {
-			failures = append(failures, fmt.Sprintf("%s: %v", account.Name, logoutErr))
-			continue
-		}
+		allEmails = append(allEmails, result.emails...)
+	}
 
-		if err := printEmails(output, emails); err != nil {
-			return err
-		}
-		if err := writeActionSummary(output, a.Action, len(emails)); err != nil {
-			return err
-		}
+	if len(allEmails) == 0 && len(failures) > 0 {
+		return fmt.Errorf("%d account(s) failed: %s", len(failures), strings.Join(failures, "; "))
+	}
+
+	if err := printEmails(output, allEmails); err != nil {
+		return err
+	}
+	if err := writeActionSummary(output, a.Action, len(allEmails)); err != nil {
+		return err
 	}
 
 	if len(failures) > 0 {
@@ -280,10 +333,15 @@ func (a *App) deleteByRange(session SessionWithInboxRead) ([]EmailSummary, error
 
 func writeEmailSummaries(output io.Writer, emails []EmailSummary) error {
 	for _, email := range emails {
+		accountPrefix := ""
+		if email.Account != "" {
+			accountPrefix = fmt.Sprintf("account=%s | ", email.Account)
+		}
 		if _, err := fmt.Fprintf(
 			output,
-			"%s | mailbox=%s | %s | from=%s | to=%s | uid=%d\n",
+			"%s | %smailbox=%s | %s | from=%s | to=%s | uid=%d\n",
 			email.ReceivedAt.Format(time.RFC3339),
+			accountPrefix,
 			email.Mailbox,
 			email.Subject,
 			email.From,

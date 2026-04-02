@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -239,7 +240,7 @@ func TestAppRunDeletePrintsEmailsAndCount(t *testing.T) {
 	}
 }
 
-func TestAppRunMultipleAccountsPrintsGroupedOutput(t *testing.T) {
+func TestAppRunMultipleAccountsAggregatesOutput(t *testing.T) {
 	buffer := &bytes.Buffer{}
 	sessions := map[string]*stubSession{
 		"one@example.com": {
@@ -288,17 +289,57 @@ func TestAppRunMultipleAccountsPrintsGroupedOutput(t *testing.T) {
 	}
 
 	output := buffer.String()
-	if !strings.Contains(output, "account=gmail email=one@example.com") {
-		t.Fatalf("Run() output = %q, want first account header", output)
+	if !strings.Contains(output, "account=gmail |") {
+		t.Fatalf("Run() output = %q, want gmail account label", output)
 	}
-	if !strings.Contains(output, "account=icloud email=two@example.com") {
-		t.Fatalf("Run() output = %q, want second account header", output)
+	if !strings.Contains(output, "account=icloud |") {
+		t.Fatalf("Run() output = %q, want icloud account label", output)
 	}
-	if strings.Count(output, "retrieved 1 emails") != 2 {
-		t.Fatalf("Run() output = %q, want two retrieved summaries", output)
+	if strings.Count(output, "retrieved 2 emails") != 1 {
+		t.Fatalf("Run() output = %q, want one aggregated summary", output)
 	}
 	if !sessions["one@example.com"].loggedOut || !sessions["two@example.com"].loggedOut {
 		t.Fatalf("sessions logged out = %#v", sessions)
+	}
+}
+
+func TestAppRunDoesNotPrintEmptySummaryWhenAllAccountsFail(t *testing.T) {
+	buffer := &bytes.Buffer{}
+
+	app := &App{
+		Accounts: []ConfiguredAccount{
+			{
+				Name: "gmail",
+				Client: &IMAPClient{
+					Address: "imap.gmail.com:993",
+					Email:   "one@example.com",
+				},
+			},
+			{
+				Name: "icloud",
+				Client: &IMAPClient{
+					Address: "imap.mail.me.com:993",
+					Email:   "two@example.com",
+				},
+			},
+		},
+		Login: func(_ context.Context, client *IMAPClient) (SessionWithInboxRead, error) {
+			return nil, fmt.Errorf("login failed for %s", client.Email)
+		},
+		Range:   "all",
+		Timeout: time.Second,
+		Output:  buffer,
+	}
+
+	err := app.Run(context.Background())
+	if err == nil {
+		t.Fatal("Run() error = nil, want failure")
+	}
+	if !strings.Contains(err.Error(), "2 account(s) failed") {
+		t.Fatalf("Run() error = %v, want aggregated failure", err)
+	}
+	if buffer.Len() != 0 {
+		t.Fatalf("Run() output = %q, want no empty summary", buffer.String())
 	}
 }
 
