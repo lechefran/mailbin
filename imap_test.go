@@ -1,0 +1,826 @@
+package main
+
+import (
+	"bufio"
+	"context"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
+	"fmt"
+	"math/big"
+	"net"
+	"slices"
+	"strconv"
+	"strings"
+	"testing"
+	"time"
+)
+
+func TestIMAPClientLoginSuccess(t *testing.T) {
+	server := newFakeIMAPServer(t, fakeIMAPServerConfig{
+		email:    "user@example.com",
+		password: `pa"ss\word`,
+		accept:   true,
+	})
+	t.Cleanup(server.Close)
+
+	client := &IMAPClient{
+		Address:   server.Address(),
+		Email:     "user@example.com",
+		Password:  `pa"ss\word`,
+		TLSConfig: server.ClientTLSConfig(),
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	session, err := client.Login(ctx)
+	if err != nil {
+		t.Fatalf("Login() error = %v", err)
+	}
+
+	if err := session.Logout(); err != nil {
+		t.Fatalf("Logout() error = %v", err)
+	}
+}
+
+func TestIMAPClientLoginRejected(t *testing.T) {
+	server := newFakeIMAPServer(t, fakeIMAPServerConfig{
+		email:    "user@example.com",
+		password: "correct-password",
+		accept:   false,
+	})
+	t.Cleanup(server.Close)
+
+	client := &IMAPClient{
+		Address:   server.Address(),
+		Email:     "user@example.com",
+		Password:  "wrong-password",
+		TLSConfig: server.ClientTLSConfig(),
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	_, err := client.Login(ctx)
+	if err == nil {
+		t.Fatal("Login() error = nil, want failure")
+	}
+	if !strings.Contains(err.Error(), "login failed") {
+		t.Fatalf("Login() error = %v, want login failure", err)
+	}
+}
+
+func TestIMAPClientLoginRejectsCredentialsWithNewlines(t *testing.T) {
+	client := &IMAPClient{
+		Address:  "imap.example.com:993",
+		Email:    "user@example.com",
+		Password: "bad\npassword",
+	}
+
+	_, err := client.Login(context.Background())
+	if err == nil {
+		t.Fatal("Login() error = nil, want validation failure")
+	}
+	if !strings.Contains(err.Error(), "invalid password") {
+		t.Fatalf("Login() error = %v, want invalid password", err)
+	}
+}
+
+func TestIMAPSessionReadInboxViews(t *testing.T) {
+	now := time.Date(2026, time.April, 1, 15, 30, 0, 0, time.UTC)
+	server := newFakeIMAPServer(t, fakeIMAPServerConfig{
+		email:    "user@example.com",
+		password: "correct-password",
+		accept:   true,
+		mailboxes: []fakeIMAPMailbox{
+			{
+				Name:         "INBOX",
+				UnquotedList: true,
+				Messages: []fakeIMAPMessage{
+					{
+						UID:        101,
+						MessageID:  "<today@example.com>",
+						ReceivedAt: time.Date(2026, time.April, 1, 8, 0, 0, 0, time.UTC),
+						Subject:    "Today message",
+						From:       "alerts@example.com",
+						To:         "user@example.com",
+					},
+					{
+						UID:        102,
+						MessageID:  "<week@example.com>",
+						ReceivedAt: time.Date(2026, time.March, 28, 10, 0, 0, 0, time.UTC),
+						Subject:    "This week message",
+						From:       "reports@example.com",
+						To:         "user@example.com",
+					},
+				},
+			},
+			{
+				Name: "Archive",
+				Messages: []fakeIMAPMessage{
+					{
+						UID:        103,
+						MessageID:  "<month@example.com>",
+						ReceivedAt: time.Date(2026, time.March, 10, 11, 0, 0, 0, time.UTC),
+						Subject:    "This month message",
+						From:       "digest@example.com",
+						To:         "user@example.com",
+					},
+				},
+			},
+			{
+				Name:      "BrokenFetch",
+				FailFetch: true,
+				Messages: []fakeIMAPMessage{
+					{
+						UID:        203,
+						MessageID:  "<brokenfetch@example.com>",
+						ReceivedAt: time.Date(2026, time.March, 20, 11, 0, 0, 0, time.UTC),
+						Subject:    "Broken fetch message",
+						From:       "brokenfetch@example.com",
+						To:         "user@example.com",
+					},
+				},
+			},
+			{
+				Name:       "BrokenSearch",
+				FailSearch: true,
+				Messages: []fakeIMAPMessage{
+					{
+						UID:        202,
+						MessageID:  "<brokensearch@example.com>",
+						ReceivedAt: time.Date(2026, time.March, 21, 11, 0, 0, 0, time.UTC),
+						Subject:    "Broken search message",
+						From:       "brokensearch@example.com",
+						To:         "user@example.com",
+					},
+				},
+			},
+			{
+				Name: "[Gmail]/Spam",
+				Messages: []fakeIMAPMessage{
+					{
+						UID:        104,
+						MessageID:  "<spam@example.com>",
+						ReceivedAt: time.Date(2026, time.March, 29, 9, 0, 0, 0, time.UTC),
+						Subject:    "Spam message",
+						From:       "spam@example.com",
+						To:         "user@example.com",
+					},
+				},
+			},
+			{
+				Name: "[Gmail]/Trash",
+				Messages: []fakeIMAPMessage{
+					{
+						UID:        105,
+						MessageID:  "<trash@example.com>",
+						ReceivedAt: time.Date(2026, time.March, 5, 9, 0, 0, 0, time.UTC),
+						Subject:    "Trash message",
+						From:       "trash@example.com",
+						To:         "user@example.com",
+					},
+				},
+			},
+			{
+				Name: "[Gmail]/All Mail",
+				Messages: []fakeIMAPMessage{
+					{
+						UID:        106,
+						MessageID:  "<today@example.com>",
+						ReceivedAt: time.Date(2026, time.April, 1, 8, 0, 0, 0, time.UTC),
+						Subject:    "Today message duplicate",
+						From:       "alerts@example.com",
+						To:         "user@example.com",
+					},
+					{
+						UID:        107,
+						MessageID:  "<allmailonly@example.com>",
+						ReceivedAt: time.Date(2026, time.March, 8, 7, 0, 0, 0, time.UTC),
+						Subject:    "All mail only message",
+						From:       "allmail@example.com",
+						To:         "user@example.com",
+					},
+				},
+			},
+			{
+				Name:       "BrokenSelect",
+				FailSelect: true,
+			},
+			{
+				Name:     "Noselect",
+				NoSelect: true,
+				Messages: nil,
+			},
+		},
+	})
+	t.Cleanup(server.Close)
+
+	client := &IMAPClient{
+		Address:   server.Address(),
+		Email:     "user@example.com",
+		Password:  "correct-password",
+		TLSConfig: server.ClientTLSConfig(),
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	session, err := client.Login(ctx)
+	if err != nil {
+		t.Fatalf("Login() error = %v", err)
+	}
+	defer session.Logout()
+
+	testCases := []struct {
+		name         string
+		read         func() ([]EmailSummary, error)
+		wantSubjects []string
+	}{
+		{
+			name: "all",
+			read: func() ([]EmailSummary, error) {
+				return session.ReadInboxAll()
+			},
+			wantSubjects: []string{
+				"Today message",
+				"This week message",
+				"This month message",
+				"Spam message",
+				"Trash message",
+				"All mail only message",
+			},
+		},
+		{
+			name: "today",
+			read: func() ([]EmailSummary, error) {
+				return session.ReadInboxToday(now)
+			},
+			wantSubjects: []string{
+				"Today message",
+			},
+		},
+		{
+			name: "week",
+			read: func() ([]EmailSummary, error) {
+				return session.ReadInboxThisWeek(now)
+			},
+			wantSubjects: []string{
+				"Today message",
+				"This week message",
+				"Spam message",
+			},
+		},
+		{
+			name: "month",
+			read: func() ([]EmailSummary, error) {
+				return session.ReadInboxThisMonth(now)
+			},
+			wantSubjects: []string{
+				"Today message",
+				"This week message",
+				"This month message",
+				"Spam message",
+				"Trash message",
+				"All mail only message",
+			},
+		},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			emails, err := testCase.read()
+			if err != nil {
+				t.Fatalf("%s read error = %v", testCase.name, err)
+			}
+
+			subjects := make([]string, 0, len(emails))
+			for _, email := range emails {
+				subjects = append(subjects, email.Subject)
+			}
+
+			if !slices.Equal(subjects, testCase.wantSubjects) {
+				t.Fatalf("%s subjects = %v, want %v", testCase.name, subjects, testCase.wantSubjects)
+			}
+
+			if testCase.name == "all" {
+				for _, email := range emails {
+					if email.MessageID == "<today@example.com>" && email.Mailbox != "INBOX" {
+						t.Fatalf("duplicate message kept mailbox %q, want INBOX", email.Mailbox)
+					}
+				}
+			}
+		})
+	}
+}
+
+func TestIMAPSessionReadInboxAllHonorsDeadline(t *testing.T) {
+	server := newFakeIMAPServer(t, fakeIMAPServerConfig{
+		email:     "user@example.com",
+		password:  "correct-password",
+		accept:    true,
+		stallList: 300 * time.Millisecond,
+	})
+	t.Cleanup(server.Close)
+
+	client := &IMAPClient{
+		Address:   server.Address(),
+		Email:     "user@example.com",
+		Password:  "correct-password",
+		TLSConfig: server.ClientTLSConfig(),
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	session, err := client.Login(ctx)
+	if err != nil {
+		t.Fatalf("Login() error = %v", err)
+	}
+	t.Cleanup(func() {
+		_ = session.conn.Close()
+	})
+
+	_, err = session.ReadInboxAll()
+	if err == nil {
+		t.Fatal("ReadInboxAll() error = nil, want timeout")
+	}
+
+	lowerError := strings.ToLower(err.Error())
+	if !strings.Contains(lowerError, "timeout") && !strings.Contains(lowerError, "deadline") {
+		t.Fatalf("ReadInboxAll() error = %v, want timeout or deadline failure", err)
+	}
+}
+
+type fakeIMAPServer struct {
+	listener  net.Listener
+	config    *tls.Config
+	email     string
+	password  string
+	accept    bool
+	mailboxes []fakeIMAPMailbox
+	selected  string
+	stallList time.Duration
+}
+
+type fakeIMAPServerConfig struct {
+	email     string
+	password  string
+	accept    bool
+	mailboxes []fakeIMAPMailbox
+	stallList time.Duration
+}
+
+type fakeIMAPMailbox struct {
+	Name         string
+	NoSelect     bool
+	UnquotedList bool
+	FailSelect   bool
+	FailSearch   bool
+	FailFetch    bool
+	Messages     []fakeIMAPMessage
+}
+
+type fakeIMAPMessage struct {
+	UID        uint32
+	MessageID  string
+	ReceivedAt time.Time
+	Subject    string
+	From       string
+	To         string
+}
+
+func newFakeIMAPServer(t *testing.T, config fakeIMAPServerConfig) *fakeIMAPServer {
+	t.Helper()
+
+	certificate := newTestCertificate(t)
+	listener, err := tls.Listen("tcp", "127.0.0.1:0", &tls.Config{
+		Certificates: []tls.Certificate{certificate},
+		MinVersion:   tls.VersionTLS12,
+	})
+	if err != nil {
+		t.Fatalf("tls.Listen() error = %v", err)
+	}
+
+	server := &fakeIMAPServer{
+		listener: listener,
+		config: &tls.Config{
+			RootCAs:    newCertPool(t, certificate),
+			ServerName: "localhost",
+			MinVersion: tls.VersionTLS12,
+		},
+		email:     config.email,
+		password:  config.password,
+		accept:    config.accept,
+		mailboxes: config.mailboxes,
+		stallList: config.stallList,
+	}
+
+	go server.serve(t)
+	return server
+}
+
+func (s *fakeIMAPServer) Address() string {
+	return s.listener.Addr().String()
+}
+
+func (s *fakeIMAPServer) ClientTLSConfig() *tls.Config {
+	return s.config.Clone()
+}
+
+func (s *fakeIMAPServer) Close() {
+	_ = s.listener.Close()
+}
+
+func (s *fakeIMAPServer) serve(t *testing.T) {
+	t.Helper()
+
+	conn, err := s.listener.Accept()
+	if err != nil {
+		return
+	}
+	defer conn.Close()
+
+	reader := bufio.NewReader(conn)
+	writer := bufio.NewWriter(conn)
+
+	if _, err := writer.WriteString("* OK IMAP4rev1 ready\r\n"); err != nil {
+		t.Logf("WriteString(greeting) error = %v", err)
+		return
+	}
+	if err := writer.Flush(); err != nil {
+		t.Logf("Flush(greeting) error = %v", err)
+		return
+	}
+
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			return
+		}
+
+		tag, command, args, err := parseIMAPCommand(strings.TrimRight(line, "\r\n"))
+		if err != nil {
+			t.Logf("parseIMAPCommand() error = %v", err)
+			return
+		}
+
+		switch command {
+		case "LOGIN":
+			loginArgs, err := parseIMAPQuotedArgs(args)
+			if err != nil {
+				t.Logf("parseIMAPQuotedArgs(LOGIN) error = %v", err)
+				return
+			}
+
+			if len(loginArgs) != 2 {
+				t.Logf("LOGIN args = %v, want 2 values", args)
+				return
+			}
+
+			if s.accept && loginArgs[0] == s.email && loginArgs[1] == s.password {
+				if _, err := fmt.Fprintf(writer, "%s OK LOGIN completed\r\n", tag); err != nil {
+					t.Logf("LOGIN OK response error = %v", err)
+					return
+				}
+			} else {
+				if _, err := fmt.Fprintf(writer, "%s NO invalid credentials\r\n", tag); err != nil {
+					t.Logf("LOGIN NO response error = %v", err)
+					return
+				}
+			}
+		case "LIST":
+			if s.stallList > 0 {
+				time.Sleep(s.stallList)
+				return
+			}
+			if err := s.writeListResponse(writer, tag); err != nil {
+				t.Logf("writeListResponse() error = %v", err)
+				return
+			}
+		case "SELECT":
+			selectArgs, err := parseIMAPQuotedArgs(args)
+			if err != nil {
+				t.Logf("parseIMAPQuotedArgs(SELECT) error = %v", err)
+				return
+			}
+			mailbox, ok := s.findMailbox(selectArgs)
+			if !ok || mailbox.NoSelect || mailbox.FailSelect {
+				if _, err := fmt.Fprintf(writer, "%s NO unknown mailbox\r\n", tag); err != nil {
+					t.Logf("SELECT NO response error = %v", err)
+					return
+				}
+				break
+			}
+			s.selected = mailbox.Name
+			if _, err := fmt.Fprintf(writer, "* %d EXISTS\r\n", len(mailbox.Messages)); err != nil {
+				t.Logf("SELECT EXISTS response error = %v", err)
+				return
+			}
+			if _, err := fmt.Fprintf(writer, "%s OK [READ-WRITE] SELECT completed\r\n", tag); err != nil {
+				t.Logf("SELECT OK response error = %v", err)
+				return
+			}
+		case "SEARCH":
+			sequenceNumbers, err := s.searchMessages(s.selected, args)
+			if err != nil {
+				if _, writeErr := fmt.Fprintf(writer, "%s NO %s\r\n", tag, err); writeErr != nil {
+					t.Logf("SEARCH NO response error = %v", writeErr)
+					return
+				}
+				break
+			}
+
+			var values []string
+			for _, sequenceNumber := range sequenceNumbers {
+				values = append(values, strconv.Itoa(sequenceNumber))
+			}
+
+			if len(values) == 0 {
+				if _, err := writer.WriteString("* SEARCH\r\n"); err != nil {
+					t.Logf("SEARCH empty response error = %v", err)
+					return
+				}
+			} else {
+				if _, err := fmt.Fprintf(writer, "* SEARCH %s\r\n", strings.Join(values, " ")); err != nil {
+					t.Logf("SEARCH response error = %v", err)
+					return
+				}
+			}
+			if _, err := fmt.Fprintf(writer, "%s OK SEARCH completed\r\n", tag); err != nil {
+				t.Logf("SEARCH OK response error = %v", err)
+				return
+			}
+		case "FETCH":
+			if err := s.writeFetchResponse(writer, tag, s.selected, args); err != nil {
+				if _, writeErr := fmt.Fprintf(writer, "%s NO %s\r\n", tag, err); writeErr != nil {
+					t.Logf("FETCH NO response error = %v", writeErr)
+					return
+				}
+			}
+		case "LOGOUT":
+			if _, err := writer.WriteString("* BYE logging out\r\n"); err != nil {
+				t.Logf("LOGOUT BYE response error = %v", err)
+				return
+			}
+			if _, err := fmt.Fprintf(writer, "%s OK LOGOUT completed\r\n", tag); err != nil {
+				t.Logf("LOGOUT OK response error = %v", err)
+				return
+			}
+		default:
+			if _, err := fmt.Fprintf(writer, "%s BAD unsupported command\r\n", tag); err != nil {
+				t.Logf("BAD response error = %v", err)
+				return
+			}
+		}
+
+		if err := writer.Flush(); err != nil {
+			t.Logf("Flush() error = %v", err)
+			return
+		}
+
+		if command == "LOGOUT" {
+			return
+		}
+	}
+}
+
+func (s *fakeIMAPServer) writeListResponse(writer *bufio.Writer, tag string) error {
+	for _, mailbox := range s.mailboxes {
+		flags := ""
+		if mailbox.NoSelect {
+			flags = `\Noselect`
+		}
+		if mailbox.UnquotedList {
+			if _, err := fmt.Fprintf(writer, `* LIST (%s) "/" %s`+"\r\n", flags, mailbox.Name); err != nil {
+				return err
+			}
+			continue
+		}
+		if _, err := fmt.Fprintf(writer, `* LIST (%s) "/" %q`+"\r\n", flags, mailbox.Name); err != nil {
+			return err
+		}
+	}
+
+	if _, err := fmt.Fprintf(writer, "%s OK LIST completed\r\n", tag); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (s *fakeIMAPServer) findMailbox(args []string) (fakeIMAPMailbox, bool) {
+	if len(args) != 1 {
+		return fakeIMAPMailbox{}, false
+	}
+
+	for _, mailbox := range s.mailboxes {
+		if mailbox.Name == args[0] {
+			return mailbox, true
+		}
+	}
+
+	return fakeIMAPMailbox{}, false
+}
+
+func (s *fakeIMAPServer) searchMessages(mailboxName, criteria string) ([]int, error) {
+	mailbox, ok := s.findMailbox([]string{mailboxName})
+	if !ok {
+		return nil, fmt.Errorf("no selected mailbox")
+	}
+	if mailbox.FailSearch {
+		return nil, fmt.Errorf("search failed for mailbox %s", mailbox.Name)
+	}
+
+	criteria = strings.TrimSpace(criteria)
+	switch {
+	case criteria == "ALL":
+		sequenceNumbers := make([]int, 0, len(mailbox.Messages))
+		for index := range mailbox.Messages {
+			sequenceNumbers = append(sequenceNumbers, index+1)
+		}
+		return sequenceNumbers, nil
+	case strings.HasPrefix(criteria, "SINCE "):
+		since, err := time.Parse("02-Jan-2006", strings.TrimSpace(strings.TrimPrefix(criteria, "SINCE ")))
+		if err != nil {
+			return nil, err
+		}
+
+		var sequenceNumbers []int
+		for index, message := range mailbox.Messages {
+			if !startOfDay(message.ReceivedAt).Before(since) {
+				sequenceNumbers = append(sequenceNumbers, index+1)
+			}
+		}
+		return sequenceNumbers, nil
+	default:
+		return nil, fmt.Errorf("unsupported SEARCH criteria: %s", criteria)
+	}
+}
+
+func (s *fakeIMAPServer) writeFetchResponse(writer *bufio.Writer, tag, mailboxName, args string) error {
+	mailbox, ok := s.findMailbox([]string{mailboxName})
+	if !ok {
+		return fmt.Errorf("no selected mailbox")
+	}
+	if mailbox.FailFetch {
+		return fmt.Errorf("fetch failed for mailbox %s", mailbox.Name)
+	}
+
+	parts := strings.SplitN(strings.TrimSpace(args), " ", 2)
+	if len(parts) != 2 {
+		return fmt.Errorf("invalid FETCH args: %s", args)
+	}
+
+	sequenceNumbers, err := parseSequenceSet(parts[0])
+	if err != nil {
+		return err
+	}
+
+	for _, sequenceNumber := range sequenceNumbers {
+		if sequenceNumber <= 0 || sequenceNumber > len(mailbox.Messages) {
+			return fmt.Errorf("sequence number %d out of range", sequenceNumber)
+		}
+
+		message := mailbox.Messages[sequenceNumber-1]
+		headers := fmt.Sprintf(
+			"Message-ID: %s\r\nSubject: %s\r\nFrom: %s\r\nTo: %s\r\n\r\n",
+			message.MessageID,
+			message.Subject,
+			message.From,
+			message.To,
+		)
+
+		if _, err := fmt.Fprintf(
+			writer,
+			"* %d FETCH (UID %d INTERNALDATE %q BODY[HEADER.FIELDS (MESSAGE-ID SUBJECT FROM TO)] {%d}\r\n",
+			sequenceNumber,
+			message.UID,
+			message.ReceivedAt.Format("02-Jan-2006 15:04:05 -0700"),
+			len(headers),
+		); err != nil {
+			return err
+		}
+		if _, err := writer.WriteString(headers); err != nil {
+			return err
+		}
+		if _, err := writer.WriteString(")\r\n"); err != nil {
+			return err
+		}
+	}
+
+	if _, err := fmt.Fprintf(writer, "%s OK FETCH completed\r\n", tag); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func parseSequenceSet(value string) ([]int, error) {
+	parts := strings.Split(value, ",")
+	sequenceNumbers := make([]int, 0, len(parts))
+	for _, part := range parts {
+		sequenceNumber, err := strconv.Atoi(part)
+		if err != nil {
+			return nil, err
+		}
+		sequenceNumbers = append(sequenceNumbers, sequenceNumber)
+	}
+
+	return sequenceNumbers, nil
+}
+
+func parseIMAPCommand(line string) (string, string, string, error) {
+	parts := strings.SplitN(line, " ", 3)
+	if len(parts) < 2 {
+		return "", "", "", fmt.Errorf("invalid command line: %s", line)
+	}
+
+	tag := parts[0]
+	command := strings.ToUpper(parts[1])
+	if len(parts) == 2 {
+		return tag, command, "", nil
+	}
+
+	return tag, command, parts[2], nil
+}
+
+func parseIMAPQuotedArgs(input string) ([]string, error) {
+	var args []string
+	remaining := strings.TrimSpace(input)
+
+	for remaining != "" {
+		if remaining[0] != '"' {
+			return nil, fmt.Errorf("argument %q is not quoted", remaining)
+		}
+
+		value, consumed, err := consumeQuotedString(remaining)
+		if err != nil {
+			return nil, err
+		}
+
+		args = append(args, value)
+		remaining = strings.TrimSpace(remaining[consumed:])
+	}
+
+	return args, nil
+}
+
+func newTestCertificate(t *testing.T) tls.Certificate {
+	t.Helper()
+
+	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("rsa.GenerateKey() error = %v", err)
+	}
+
+	template := &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject: pkix.Name{
+			CommonName: "localhost",
+		},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(time.Hour),
+		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		BasicConstraintsValid: true,
+		DNSNames:              []string{"localhost"},
+		IPAddresses:           []net.IP{net.ParseIP("127.0.0.1")},
+	}
+
+	certificateDER, err := x509.CreateCertificate(rand.Reader, template, template, &privateKey.PublicKey, privateKey)
+	if err != nil {
+		t.Fatalf("x509.CreateCertificate() error = %v", err)
+	}
+
+	certificatePEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certificateDER})
+	privateKeyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(privateKey)})
+
+	certificate, err := tls.X509KeyPair(certificatePEM, privateKeyPEM)
+	if err != nil {
+		t.Fatalf("tls.X509KeyPair() error = %v", err)
+	}
+
+	certificate.Leaf, err = x509.ParseCertificate(certificateDER)
+	if err != nil {
+		t.Fatalf("x509.ParseCertificate() error = %v", err)
+	}
+
+	return certificate
+}
+
+func newCertPool(t *testing.T, certificate tls.Certificate) *x509.CertPool {
+	t.Helper()
+
+	pool := x509.NewCertPool()
+	if certificate.Leaf == nil {
+		t.Fatal("certificate leaf is required")
+	}
+	pool.AddCert(certificate.Leaf)
+
+	return pool
+}
