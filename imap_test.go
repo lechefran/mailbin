@@ -9,12 +9,15 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+	"errors"
 	"fmt"
+	"io"
 	"math/big"
 	"net"
 	"slices"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -133,6 +136,103 @@ func TestIMAPClientLoginFallsBackAfterDNSLookupFailure(t *testing.T) {
 
 	if err := session.Logout(); err != nil {
 		t.Fatalf("Logout() error = %v", err)
+	}
+}
+
+func TestIsRetryableConnectionError(t *testing.T) {
+	testCases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{name: "nil", err: nil, want: false},
+		{name: "deadline exceeded", err: context.DeadlineExceeded, want: true},
+		{name: "io eof", err: io.EOF, want: true},
+		{name: "epipe", err: syscall.EPIPE, want: true},
+		{name: "broken pipe text", err: errors.New("write: broken pipe"), want: true},
+		{name: "connection reset text", err: errors.New("read: connection reset by peer"), want: true},
+		{name: "closed network text", err: errors.New("use of closed network connection"), want: true},
+		{name: "other", err: errors.New("permission denied"), want: false},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			got := isRetryableConnectionError(testCase.err)
+			if got != testCase.want {
+				t.Fatalf("isRetryableConnectionError(%v) = %v, want %v", testCase.err, got, testCase.want)
+			}
+		})
+	}
+}
+
+func TestParseSearchIDsFromLine(t *testing.T) {
+	testCases := []struct {
+		name       string
+		line       string
+		wantIDs    []uint32
+		wantParsed bool
+	}{
+		{
+			name:       "classic search ids",
+			line:       "* SEARCH 10 20 30",
+			wantIDs:    []uint32{10, 20, 30},
+			wantParsed: true,
+		},
+		{
+			name:       "esearch all range",
+			line:       `* ESEARCH (TAG "A0001") UID ALL 100:102,200`,
+			wantIDs:    []uint32{100, 101, 102, 200},
+			wantParsed: true,
+		},
+		{
+			name:       "esearch empty",
+			line:       `* ESEARCH (TAG "A0001") COUNT 0`,
+			wantIDs:    nil,
+			wantParsed: true,
+		},
+		{
+			name:       "unrelated line",
+			line:       "* OK [CAPABILITY IMAP4rev1] ready",
+			wantIDs:    nil,
+			wantParsed: false,
+		},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			gotIDs, gotParsed := parseSearchIDsFromLine(testCase.line)
+			if gotParsed != testCase.wantParsed {
+				t.Fatalf("parseSearchIDsFromLine(%q) parsed = %v, want %v", testCase.line, gotParsed, testCase.wantParsed)
+			}
+			if !slices.Equal(gotIDs, testCase.wantIDs) {
+				t.Fatalf("parseSearchIDsFromLine(%q) ids = %v, want %v", testCase.line, gotIDs, testCase.wantIDs)
+			}
+		})
+	}
+}
+
+func TestParseSearchIDsPrefersLineWithIDs(t *testing.T) {
+	lines := []imapResponseLine{
+		{line: `* ESEARCH (TAG "A0001") COUNT 2`},
+		{line: `* ESEARCH (TAG "A0001") UID ALL 10:11`},
+	}
+
+	ids, found := parseSearchIDs(lines)
+	if !found {
+		t.Fatal("parseSearchIDs() found = false, want true")
+	}
+	want := []uint32{10, 11}
+	if !slices.Equal(ids, want) {
+		t.Fatalf("parseSearchIDs() ids = %v, want %v", ids, want)
+	}
+}
+
+func TestParseESearchIDsSupportsSplitAllSets(t *testing.T) {
+	line := `* ESEARCH UID ALL 100:101, 200 300:301`
+	ids := parseESearchIDs(line)
+	want := []uint32{100, 101, 200, 300, 301}
+	if !slices.Equal(ids, want) {
+		t.Fatalf("parseESearchIDs() ids = %v, want %v", ids, want)
 	}
 }
 

@@ -14,6 +14,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -28,6 +29,7 @@ const (
 
 	maxDeletePasses          = 3
 	maxDeleteMailboxAttempts = 3
+	maxMailboxCommandRetries = 3
 	maxFetchRetryAttempts    = 3
 	maxStoreRetryAttempts    = 3
 	maxExpungeRetryAttempts  = 3
@@ -375,8 +377,8 @@ deletePasses:
 			log.Printf("delete pass %d: scanning mailbox %s", pass+1, mailbox)
 			mailboxSummaries, hadSearchResults, err := s.deleteMailboxWithRetry(mailbox, format, args...)
 			if err != nil {
-				if isTimeoutError(err) {
-					log.Printf("skipping mailbox %s after timeout during delete: %v", mailbox, err)
+				if isRetryableConnectionError(err) {
+					log.Printf("skipping mailbox %s after retryable connection error during delete: %v", mailbox, err)
 					if reconnectErr := s.reconnect(); reconnectErr != nil {
 						if firstErr == nil && len(deletedSummaries) == 0 {
 							firstErr = reconnectErr
@@ -402,6 +404,10 @@ deletePasses:
 		}
 
 		if successfulMailboxScans == 0 && firstErr != nil && len(deletedSummaries) == 0 {
+			if isRetryableConnectionError(firstErr) {
+				log.Printf("delete pass %d: only retryable connection errors encountered; skipping failure: %v", pass+1, firstErr)
+				return nil, nil
+			}
 			return nil, firstErr
 		}
 
@@ -413,6 +419,10 @@ deletePasses:
 	}
 
 	if len(deletedSummaries) == 0 && firstErr != nil {
+		if isRetryableConnectionError(firstErr) {
+			log.Printf("delete completed with only retryable connection errors; returning no deletions without failing: %v", firstErr)
+			return nil, nil
+		}
 		return nil, firstErr
 	}
 
@@ -426,11 +436,11 @@ func (s *IMAPSession) deleteMailboxWithRetry(mailbox string, format string, args
 attemptLoop:
 	for attempt := 0; attempt < maxDeleteMailboxAttempts; attempt++ {
 		log.Printf("delete mailbox %s: attempt %d", mailbox, attempt+1)
-		if err := s.selectMailbox(mailbox); err != nil {
+		if err := s.selectMailboxWithRetry(mailbox); err != nil {
 			return deletedSummaries, false, err
 		}
 
-		uids, err := s.searchUIDs(format, args...)
+		uids, err := s.searchUIDsWithRetry(mailbox, format, args...)
 		if err != nil {
 			return deletedSummaries, false, fmt.Errorf("search mailbox %s: %w", mailbox, err)
 		}
@@ -465,7 +475,7 @@ attemptLoop:
 
 			summaries, err := s.fetchEmailSummariesByUID(mailbox, uids[start:end])
 			if err != nil {
-				if !isTimeoutError(err) {
+				if !isRetryableConnectionError(err) {
 					return deletedSummaries, true, err
 				}
 
@@ -507,14 +517,16 @@ func (s *IMAPSession) searchMailboxes(format string, args ...any) ([]mailboxSear
 	var firstErr error
 	successfulMailboxReads := 0
 	for _, mailbox := range mailboxes {
-		if err := s.selectMailbox(mailbox); err != nil {
-			if isTimeoutError(err) {
+		if err := s.selectMailboxWithRetry(mailbox); err != nil {
+			if isRetryableConnectionError(err) {
 				s.timedOut = true
-				if successfulMailboxReads > 0 {
-					log.Printf("stopping mailbox scan after timeout selecting %s: %v", mailbox, err)
-					break
+				log.Printf("skipping mailbox %s after retryable connection error selecting: %v", mailbox, err)
+				if reconnectErr := s.reconnect(); reconnectErr != nil {
+					if firstErr == nil {
+						firstErr = reconnectErr
+					}
 				}
-				return nil, err
+				continue
 			}
 			if firstErr == nil {
 				firstErr = err
@@ -522,15 +534,17 @@ func (s *IMAPSession) searchMailboxes(format string, args ...any) ([]mailboxSear
 			continue
 		}
 
-		sequenceNumbers, err := s.search(format, args...)
+		sequenceNumbers, err := s.searchWithRetry(mailbox, format, args...)
 		if err != nil {
-			if isTimeoutError(err) {
+			if isRetryableConnectionError(err) {
 				s.timedOut = true
-				if successfulMailboxReads > 0 {
-					log.Printf("stopping mailbox scan after timeout searching %s: %v", mailbox, err)
-					break
+				log.Printf("skipping mailbox %s after retryable connection error searching: %v", mailbox, err)
+				if reconnectErr := s.reconnect(); reconnectErr != nil {
+					if firstErr == nil {
+						firstErr = reconnectErr
+					}
 				}
-				return nil, fmt.Errorf("search mailbox %s: %w", mailbox, err)
+				continue
 			}
 			if firstErr == nil {
 				firstErr = fmt.Errorf("search mailbox %s: %w", mailbox, err)
@@ -540,13 +554,15 @@ func (s *IMAPSession) searchMailboxes(format string, args ...any) ([]mailboxSear
 
 		mailboxSummaries, err := s.fetchEmailSummaries(mailbox, sequenceNumbers)
 		if err != nil {
-			if isTimeoutError(err) {
+			if isRetryableConnectionError(err) {
 				s.timedOut = true
-				if successfulMailboxReads > 0 {
-					log.Printf("stopping mailbox scan after timeout fetching %s: %v", mailbox, err)
-					break
+				log.Printf("skipping mailbox %s after retryable connection error fetching: %v", mailbox, err)
+				if reconnectErr := s.reconnect(); reconnectErr != nil {
+					if firstErr == nil {
+						firstErr = reconnectErr
+					}
 				}
-				return nil, fmt.Errorf("fetch mailbox %s: %w", mailbox, err)
+				continue
 			}
 			if firstErr == nil {
 				firstErr = fmt.Errorf("fetch mailbox %s: %w", mailbox, err)
@@ -561,6 +577,10 @@ func (s *IMAPSession) searchMailboxes(format string, args ...any) ([]mailboxSear
 	}
 
 	if successfulMailboxReads == 0 && firstErr != nil {
+		if isRetryableConnectionError(firstErr) {
+			log.Printf("read completed with only retryable connection errors; returning empty results without failing: %v", firstErr)
+			return nil, nil
+		}
 		return nil, firstErr
 	}
 
@@ -673,7 +693,7 @@ func (s *IMAPSession) storeDeletedFlagByUIDWithRetry(summary EmailSummary) error
 		if err == nil {
 			return nil
 		}
-		if !isTimeoutError(err) {
+		if !isRetryableConnectionError(err) {
 			return err
 		}
 
@@ -728,7 +748,7 @@ func (s *IMAPSession) expungeMailboxWithRetry(mailbox string) error {
 		if err == nil {
 			return nil
 		}
-		if !isTimeoutError(err) {
+		if !isRetryableConnectionError(err) {
 			return err
 		}
 
@@ -756,9 +776,29 @@ func (s *IMAPSession) expungeMailboxWithRetry(mailbox string) error {
 }
 
 func (s *IMAPSession) listMailboxes() ([]string, error) {
-	lines, _, err := s.runCommand(`LIST "" "*"`)
-	if err != nil {
-		return nil, fmt.Errorf("list mailboxes: %w", err)
+	var lines []imapResponseLine
+	var err error
+	for attempt := 0; attempt < maxMailboxCommandRetries; attempt++ {
+		lines, _, err = s.runCommand(`LIST "" "*"`)
+		if err == nil {
+			break
+		}
+		if !isRetryableConnectionError(err) {
+			return nil, fmt.Errorf("list mailboxes: %w", err)
+		}
+
+		log.Printf(
+			"retrying LIST after retryable connection error (attempt %d/%d): %v",
+			attempt+1,
+			maxMailboxCommandRetries,
+			err,
+		)
+		if attempt == maxMailboxCommandRetries-1 {
+			return nil, fmt.Errorf("list mailboxes: %w", err)
+		}
+		if reconnectErr := s.reconnect(); reconnectErr != nil {
+			return nil, fmt.Errorf("list mailboxes reconnect: %w", reconnectErr)
+		}
 	}
 
 	var mailboxes []string
@@ -809,35 +849,90 @@ func (s *IMAPSession) selectMailbox(mailbox string) error {
 	return nil
 }
 
+func (s *IMAPSession) selectMailboxWithRetry(mailbox string) error {
+	var lastErr error
+	for attempt := 0; attempt < maxMailboxCommandRetries; attempt++ {
+		if err := s.selectMailbox(mailbox); err == nil {
+			return nil
+		} else if !isRetryableConnectionError(err) {
+			return err
+		} else {
+			lastErr = err
+		}
+
+		log.Printf(
+			"retrying SELECT for mailbox %s after retryable connection error (attempt %d/%d): %v",
+			mailbox,
+			attempt+1,
+			maxMailboxCommandRetries,
+			lastErr,
+		)
+		if attempt == maxMailboxCommandRetries-1 {
+			break
+		}
+		if err := s.reconnect(); err != nil {
+			return err
+		}
+	}
+
+	if lastErr != nil {
+		return lastErr
+	}
+
+	return fmt.Errorf("select mailbox %s failed", mailbox)
+}
+
 func (s *IMAPSession) search(format string, args ...any) ([]int, error) {
 	lines, _, err := s.runCommand("SEARCH "+format, args...)
 	if err != nil {
 		return nil, fmt.Errorf("search mailbox: %w", err)
 	}
 
-	for _, responseLine := range lines {
-		if !strings.HasPrefix(responseLine.line, "* SEARCH") {
-			continue
-		}
-
-		fields := strings.Fields(responseLine.line)
-		if len(fields) <= 2 {
-			return nil, nil
-		}
-
-		sequenceNumbers := make([]int, 0, len(fields)-2)
-		for _, value := range fields[2:] {
-			sequenceNumber, err := strconv.Atoi(value)
-			if err != nil {
-				return nil, fmt.Errorf("parse search sequence number %q: %w", value, err)
-			}
-			sequenceNumbers = append(sequenceNumbers, sequenceNumber)
-		}
-
-		return sequenceNumbers, nil
+	ids, found := parseSearchIDs(lines)
+	if !found || len(ids) == 0 {
+		return nil, nil
 	}
 
-	return nil, fmt.Errorf("missing SEARCH response")
+	sequenceNumbers := make([]int, 0, len(ids))
+	for _, id := range ids {
+		sequenceNumbers = append(sequenceNumbers, int(id))
+	}
+
+	return sequenceNumbers, nil
+}
+
+func (s *IMAPSession) searchWithRetry(mailbox string, format string, args ...any) ([]int, error) {
+	var lastErr error
+	for attempt := 0; attempt < maxMailboxCommandRetries; attempt++ {
+		sequenceNumbers, err := s.search(format, args...)
+		if err == nil {
+			return sequenceNumbers, nil
+		}
+		if !isRetryableConnectionError(err) {
+			return nil, err
+		}
+
+		lastErr = err
+		log.Printf(
+			"retrying SEARCH for mailbox %s after retryable connection error (attempt %d/%d): %v",
+			mailbox,
+			attempt+1,
+			maxMailboxCommandRetries,
+			err,
+		)
+		if attempt == maxMailboxCommandRetries-1 {
+			break
+		}
+		if reconnectErr := s.reconnectAndSelectMailbox(mailbox); reconnectErr != nil {
+			return nil, reconnectErr
+		}
+	}
+
+	if lastErr != nil {
+		return nil, lastErr
+	}
+
+	return nil, fmt.Errorf("search mailbox %s failed", mailbox)
 }
 
 func (s *IMAPSession) searchUIDs(format string, args ...any) ([]uint32, error) {
@@ -846,29 +941,177 @@ func (s *IMAPSession) searchUIDs(format string, args ...any) ([]uint32, error) {
 		return nil, fmt.Errorf("search mailbox: %w", err)
 	}
 
+	uids, _ := parseSearchIDs(lines)
+	if len(uids) == 0 {
+		return nil, nil
+	}
+
+	return uids, nil
+}
+
+func parseSearchIDs(lines []imapResponseLine) ([]uint32, bool) {
+	sawRecognized := false
 	for _, responseLine := range lines {
-		if !strings.HasPrefix(responseLine.line, "* SEARCH") {
+		ids, lineRecognized := parseSearchIDsFromLine(responseLine.line)
+		if !lineRecognized {
+			continue
+		}
+		sawRecognized = true
+		if len(ids) == 0 {
 			continue
 		}
 
-		fields := strings.Fields(responseLine.line)
-		if len(fields) <= 2 {
-			return nil, nil
-		}
-
-		uids := make([]uint32, 0, len(fields)-2)
-		for _, value := range fields[2:] {
-			uid64, err := strconv.ParseUint(value, 10, 32)
-			if err != nil {
-				return nil, fmt.Errorf("parse search uid %q: %w", value, err)
-			}
-			uids = append(uids, uint32(uid64))
-		}
-
-		return uids, nil
+		return ids, true
 	}
 
-	return nil, fmt.Errorf("missing SEARCH response")
+	return nil, sawRecognized
+}
+
+func parseSearchIDsFromLine(line string) ([]uint32, bool) {
+	trimmed := strings.TrimSpace(line)
+	upper := strings.ToUpper(trimmed)
+	switch {
+	case strings.HasPrefix(upper, "* SEARCH"):
+		fields := strings.Fields(trimmed)
+		if len(fields) <= 2 {
+			return nil, true
+		}
+		return parseIDTokens(fields[2:]), true
+	case strings.HasPrefix(upper, "* ESEARCH"):
+		return parseESearchIDs(trimmed), true
+	default:
+		return nil, false
+	}
+}
+
+func parseESearchIDs(line string) []uint32 {
+	upper := strings.ToUpper(line)
+	allIndex := strings.Index(upper, " ALL ")
+	if allIndex == -1 {
+		return nil
+	}
+
+	afterAll := strings.TrimSpace(line[allIndex+len(" ALL "):])
+	if afterAll == "" {
+		return nil
+	}
+
+	return parseIDTokens(strings.Fields(afterAll))
+}
+
+func parseIDTokens(tokens []string) []uint32 {
+	var ids []uint32
+	for _, token := range tokens {
+		expanded := expandIDToken(token)
+		if len(expanded) == 0 {
+			continue
+		}
+		ids = append(ids, expanded...)
+	}
+
+	return ids
+}
+
+func expandIDToken(token string) []uint32 {
+	cleanToken := strings.Trim(token, "(),")
+	if cleanToken == "" || strings.Contains(cleanToken, "*") {
+		return nil
+	}
+
+	parts := strings.Split(cleanToken, ",")
+	var ids []uint32
+	for _, part := range parts {
+		segment := strings.TrimSpace(part)
+		if segment == "" {
+			continue
+		}
+
+		if strings.Contains(segment, ":") {
+			rangeIDs := expandIDRange(segment)
+			if len(rangeIDs) == 0 {
+				continue
+			}
+			ids = append(ids, rangeIDs...)
+			continue
+		}
+
+		value, err := strconv.ParseUint(segment, 10, 32)
+		if err != nil {
+			continue
+		}
+		ids = append(ids, uint32(value))
+	}
+
+	return ids
+}
+
+func expandIDRange(segment string) []uint32 {
+	rangeParts := strings.SplitN(segment, ":", 2)
+	if len(rangeParts) != 2 {
+		return nil
+	}
+
+	start, err := strconv.ParseUint(strings.TrimSpace(rangeParts[0]), 10, 32)
+	if err != nil {
+		return nil
+	}
+	end, err := strconv.ParseUint(strings.TrimSpace(rangeParts[1]), 10, 32)
+	if err != nil {
+		return nil
+	}
+
+	start32 := uint32(start)
+	end32 := uint32(end)
+	if start32 <= end32 {
+		ids := make([]uint32, 0, int(end32-start32)+1)
+		for value := start32; value <= end32; value++ {
+			ids = append(ids, value)
+		}
+		return ids
+	}
+
+	ids := make([]uint32, 0, int(start32-end32)+1)
+	for value := start32; value >= end32; value-- {
+		ids = append(ids, value)
+		if value == 0 {
+			break
+		}
+	}
+	return ids
+}
+
+func (s *IMAPSession) searchUIDsWithRetry(mailbox string, format string, args ...any) ([]uint32, error) {
+	var lastErr error
+	for attempt := 0; attempt < maxMailboxCommandRetries; attempt++ {
+		uids, err := s.searchUIDs(format, args...)
+		if err == nil {
+			return uids, nil
+		}
+		if !isRetryableConnectionError(err) {
+			return nil, err
+		}
+
+		lastErr = err
+		log.Printf(
+			"retrying UID SEARCH for mailbox %s after retryable connection error (attempt %d/%d): %v",
+			mailbox,
+			attempt+1,
+			maxMailboxCommandRetries,
+			err,
+		)
+		if attempt == maxMailboxCommandRetries-1 {
+			break
+		}
+		if reconnectErr := s.reconnectAndSelectMailbox(mailbox); reconnectErr != nil {
+			return nil, reconnectErr
+		}
+	}
+
+	if lastErr != nil {
+		return nil, lastErr
+	}
+
+	return nil, fmt.Errorf("uid search mailbox %s failed", mailbox)
 }
 
 func (s *IMAPSession) fetchEmailSummaries(mailbox string, sequenceNumbers []int) ([]EmailSummary, error) {
@@ -938,7 +1181,7 @@ func (s *IMAPSession) fetchBatchWithRetry(
 		if err == nil {
 			return batchSummaries, nil
 		}
-		if !isTimeoutError(err) || s.client == nil {
+		if !isRetryableConnectionError(err) || s.client == nil {
 			return nil, err
 		}
 
@@ -1455,6 +1698,23 @@ func isTimeoutError(err error) bool {
 	}
 
 	return strings.Contains(strings.ToLower(err.Error()), "i/o timeout")
+}
+
+func isRetryableConnectionError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if isTimeoutError(err) {
+		return true
+	}
+	if errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) || errors.Is(err, syscall.EPIPE) {
+		return true
+	}
+
+	lower := strings.ToLower(err.Error())
+	return strings.Contains(lower, "broken pipe") ||
+		strings.Contains(lower, "connection reset by peer") ||
+		strings.Contains(lower, "use of closed network connection")
 }
 
 func isDNSLookupError(err error) bool {
