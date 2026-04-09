@@ -375,13 +375,16 @@ deletePasses:
 		log.Printf("delete pass %d/%d: scanning %d mailboxes", pass+1, maxDeletePasses, len(mailboxes))
 
 		passDeletedCount := 0
+		passMovedToTrashCount := 0
+		skippedMailboxCount := 0
 		successfulMailboxScans := 0
 		for _, mailbox := range mailboxes {
 			log.Printf("delete pass %d: scanning mailbox %s", pass+1, mailbox)
-			mailboxSummaries, hadSearchResults, err := s.deleteMailboxWithRetry(mailbox, format, args...)
+			mailboxSummaries, movedToTrashCount, hadSearchResults, err := s.deleteMailboxWithRetry(mailbox, format, args...)
 			if err != nil {
 				if isRetryableConnectionError(err) {
 					log.Printf("skipping mailbox %s after retryable connection error during delete: %v", mailbox, err)
+					skippedMailboxCount++
 					if reconnectErr := s.reconnect(); reconnectErr != nil {
 						if firstErr == nil && len(deletedSummaries) == 0 {
 							firstErr = reconnectErr
@@ -393,6 +396,7 @@ deletePasses:
 				if firstErr == nil {
 					firstErr = err
 				}
+				skippedMailboxCount++
 				continue
 			}
 			successfulMailboxScans++
@@ -402,7 +406,14 @@ deletePasses:
 			}
 
 			passDeletedCount += len(mailboxSummaries)
-			log.Printf("delete pass %d: mailbox %s deleted %d emails", pass+1, mailbox, len(mailboxSummaries))
+			passMovedToTrashCount += movedToTrashCount
+			log.Printf(
+				"delete pass %d: mailbox %s deleted %d emails and moved %d to trash",
+				pass+1,
+				mailbox,
+				len(mailboxSummaries),
+				movedToTrashCount,
+			)
 			deletedSummaries = append(deletedSummaries, mailboxSummaries...)
 		}
 
@@ -414,11 +425,21 @@ deletePasses:
 			return nil, firstErr
 		}
 
-		if passDeletedCount == 0 {
-			log.Printf("delete pass %d: no deletions found; stopping", pass+1)
+		if passDeletedCount == 0 && passMovedToTrashCount == 0 {
+			log.Printf(
+				"delete pass %d: no delete or move progress found; stopping (skipped_mailboxes=%d)",
+				pass+1,
+				skippedMailboxCount,
+			)
 			break
 		}
-		log.Printf("delete pass %d: deleted %d emails", pass+1, passDeletedCount)
+		log.Printf(
+			"delete pass %d: deleted %d emails, moved %d emails to trash, skipped %d mailboxes",
+			pass+1,
+			passDeletedCount,
+			passMovedToTrashCount,
+			skippedMailboxCount,
+		)
 	}
 
 	if len(deletedSummaries) == 0 && firstErr != nil {
@@ -432,27 +453,30 @@ deletePasses:
 	return dedupeEmailSummaries(deletedSummaries), nil
 }
 
-func (s *IMAPSession) deleteMailboxWithRetry(mailbox string, format string, args ...any) ([]EmailSummary, bool, error) {
+func (s *IMAPSession) deleteMailboxWithRetry(mailbox string, format string, args ...any) ([]EmailSummary, int, bool, error) {
 	var lastTimeoutErr error
 	deletedSummaries := make([]EmailSummary, 0)
+	movedToTrashCount := 0
+	hadSearchResults := false
 
 attemptLoop:
 	for attempt := 0; attempt < maxDeleteMailboxAttempts; attempt++ {
 		log.Printf("delete mailbox %s: attempt %d", mailbox, attempt+1)
 		if err := s.selectMailboxWithRetry(mailbox); err != nil {
-			return deletedSummaries, false, err
+			return deletedSummaries, movedToTrashCount, false, err
 		}
 
 		uids, err := s.searchUIDsWithRetry(mailbox, format, args...)
 		if err != nil {
-			return deletedSummaries, false, fmt.Errorf("search mailbox %s: %w", mailbox, err)
+			return deletedSummaries, movedToTrashCount, false, fmt.Errorf("search mailbox %s: %w", mailbox, err)
 		}
 		if len(uids) == 0 {
 			if len(deletedSummaries) > 0 {
-				return deletedSummaries, true, nil
+				return deletedSummaries, movedToTrashCount, true, nil
 			}
-			return nil, false, nil
+			return nil, movedToTrashCount, false, nil
 		}
+		hadSearchResults = true
 		log.Printf("delete mailbox %s: matched %d emails", mailbox, len(uids))
 
 		batchSize := deleteBatchSize
@@ -461,6 +485,7 @@ attemptLoop:
 		}
 
 		attemptDeletedSummaries := make([]EmailSummary, 0, len(uids))
+		attemptMovedToTrashCount := 0
 		totalBatches := (len(uids) + batchSize - 1) / batchSize
 		for start := 0; start < len(uids); start += batchSize {
 			end := start + batchSize
@@ -479,35 +504,50 @@ attemptLoop:
 			summaries, err := s.fetchEmailSummariesByUID(mailbox, uids[start:end])
 			if err != nil {
 				if !isRetryableConnectionError(err) {
-					return deletedSummaries, true, err
+					return deletedSummaries, movedToTrashCount, true, err
 				}
 
 				lastTimeoutErr = err
 				log.Printf("retrying mailbox %s delete after timeout: %v", mailbox, err)
 				if reconnectErr := s.reconnectAndSelectMailbox(mailbox); reconnectErr != nil {
-					return deletedSummaries, true, reconnectErr
+					return deletedSummaries, movedToTrashCount, true, reconnectErr
 				}
 				continue attemptLoop
 			}
 
-			deletedBatch := s.deleteSelectedMailboxMessages(summaries)
+			deletedBatch, movedToTrashCount := s.deleteSelectedMailboxMessages(summaries)
 			attemptDeletedSummaries = append(attemptDeletedSummaries, deletedBatch...)
+			attemptMovedToTrashCount += movedToTrashCount
+		}
+
+		if attemptMovedToTrashCount > 0 {
+			log.Printf(
+				"delete mailbox %s: moved %d emails to trash (not counted as deleted)",
+				mailbox,
+				attemptMovedToTrashCount,
+			)
 		}
 
 		deletedSummaries = append(deletedSummaries, attemptDeletedSummaries...)
-		return deletedSummaries, true, nil
+		movedToTrashCount += attemptMovedToTrashCount
+		return deletedSummaries, movedToTrashCount, true, nil
 	}
 
-	if len(deletedSummaries) > 0 {
-		log.Printf("mailbox %s: timed out during delete but retained %d successful deletions", mailbox, len(deletedSummaries))
-		return deletedSummaries, true, nil
+	if len(deletedSummaries) > 0 || movedToTrashCount > 0 {
+		log.Printf(
+			"mailbox %s: timed out during delete but retained partial progress deleted=%d moved_to_trash=%d",
+			mailbox,
+			len(deletedSummaries),
+			movedToTrashCount,
+		)
+		return deletedSummaries, movedToTrashCount, hadSearchResults, nil
 	}
 
 	if lastTimeoutErr != nil {
-		return nil, true, lastTimeoutErr
+		return nil, 0, hadSearchResults, lastTimeoutErr
 	}
 
-	return nil, false, nil
+	return nil, 0, hadSearchResults, nil
 }
 
 func (s *IMAPSession) searchMailboxes(format string, args ...any) ([]mailboxSearchResult, error) {
@@ -590,9 +630,9 @@ func (s *IMAPSession) searchMailboxes(format string, args ...any) ([]mailboxSear
 	return results, nil
 }
 
-func (s *IMAPSession) deleteSelectedMailboxMessages(summaries []EmailSummary) []EmailSummary {
+func (s *IMAPSession) deleteSelectedMailboxMessages(summaries []EmailSummary) ([]EmailSummary, int) {
 	if len(summaries) == 0 {
-		return nil
+		return nil, 0
 	}
 
 	orderedSummaries := append([]EmailSummary(nil), summaries...)
@@ -606,6 +646,7 @@ func (s *IMAPSession) deleteSelectedMailboxMessages(summaries []EmailSummary) []
 
 	deletedSummaries := make([]EmailSummary, 0, len(orderedSummaries))
 	pendingExpunge := make([]EmailSummary, 0, batchSize)
+	movedToTrashCount := 0
 	totalBatches := (len(orderedSummaries) + batchSize - 1) / batchSize
 
 	for batchStart := 0; batchStart < len(orderedSummaries); batchStart += batchSize {
@@ -690,7 +731,7 @@ func (s *IMAPSession) deleteSelectedMailboxMessages(summaries []EmailSummary) []
 					summary.MessageID,
 					subject,
 				)
-				deletedSummaries = append(deletedSummaries, summary)
+				movedToTrashCount++
 				continue
 			}
 
@@ -740,7 +781,7 @@ func (s *IMAPSession) deleteSelectedMailboxMessages(summaries []EmailSummary) []
 		}
 	}
 
-	return deletedSummaries
+	return deletedSummaries, movedToTrashCount
 }
 
 func (s *IMAPSession) storeDeletedFlagByUIDWithRetry(summary EmailSummary) error {

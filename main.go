@@ -13,6 +13,8 @@ import (
 	"time"
 )
 
+const defaultAccountTimeout = 30 * time.Second
+
 type App struct {
 	Client         *IMAPClient
 	Accounts       []ConfiguredAccount
@@ -58,7 +60,7 @@ func (a *App) Run(ctx context.Context) error {
 
 	timeout := a.Timeout
 	if timeout <= 0 {
-		timeout = 15 * time.Second
+		timeout = defaultAccountTimeout
 	}
 
 	login := a.Login
@@ -214,7 +216,7 @@ func newAppFromFlags() (*App, error) {
 		envBoolOrDefault("MAILBIN_INCLUDE_FLAGGED", false),
 		"deprecated: flagged/starred emails are never deleted",
 	)
-	timeout := flag.Duration("timeout", 15*time.Second, "connection timeout")
+	timeout := flag.Duration("timeout", defaultAccountTimeout, "connection timeout")
 	flag.Parse()
 
 	if *action == "delete" && *age < 0 {

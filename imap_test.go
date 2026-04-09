@@ -1213,8 +1213,8 @@ func TestIMAPSessionDeleteInboxOlderThanDaysGmailAllMailUsesPerEmailDelete(t *te
 		deletedSubjects = append(deletedSubjects, email.Subject)
 	}
 	wantDeletedSubjects := []string{
-		"All Mail old message",
 		"Inbox old message",
+		"All Mail old message",
 	}
 	if !slices.Equal(deletedSubjects, wantDeletedSubjects) {
 		t.Fatalf("DeleteInboxOlderThanDays() subjects = %v, want %v", deletedSubjects, wantDeletedSubjects)
