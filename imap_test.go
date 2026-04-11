@@ -17,6 +17,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -619,9 +620,9 @@ func TestIMAPSessionShouldMoveAllMailToTrash(t *testing.T) {
 
 func TestIsUnsupportedMoveError(t *testing.T) {
 	testCases := []struct {
-		name    string
-		err     error
-		want    bool
+		name string
+		err  error
+		want bool
 	}{
 		{
 			name: "unsupported uid command",
@@ -1641,13 +1642,13 @@ func TestIMAPSessionDeleteInboxOlderThanDaysReturnsPartialResultsAfterSearchTime
 }
 
 type fakeIMAPServer struct {
+	mu           sync.Mutex
 	listener     net.Listener
 	config       *tls.Config
 	email        string
 	password     string
 	accept       bool
 	mailboxes    []fakeIMAPMailbox
-	selected     string
 	stallList    time.Duration
 	stallSearch  time.Duration
 	selectCounts map[string]int
@@ -1758,6 +1759,7 @@ func (s *fakeIMAPServer) handleConn(t *testing.T, conn net.Conn) {
 
 	reader := bufio.NewReader(conn)
 	writer := bufio.NewWriter(conn)
+	selectedMailbox := ""
 
 	if _, err := writer.WriteString("* OK IMAP4rev1 ready\r\n"); err != nil {
 		t.Logf("WriteString(greeting) error = %v", err)
@@ -1818,8 +1820,10 @@ func (s *fakeIMAPServer) handleConn(t *testing.T, conn net.Conn) {
 				t.Logf("parseIMAPQuotedArgs(SELECT) error = %v", err)
 				return
 			}
-			mailbox, ok := s.findMailbox(selectArgs)
+			s.mu.Lock()
+			mailbox, ok := s.findMailboxLocked(selectArgs)
 			if !ok || mailbox.NoSelect || mailbox.FailSelect {
+				s.mu.Unlock()
 				if _, err := fmt.Fprintf(writer, "%s NO unknown mailbox\r\n", tag); err != nil {
 					t.Logf("SELECT NO response error = %v", err)
 					return
@@ -1827,11 +1831,16 @@ func (s *fakeIMAPServer) handleConn(t *testing.T, conn net.Conn) {
 				break
 			}
 			s.selectCounts[mailbox.Name]++
-			if mailbox.StallSelect > 0 && s.selectCounts[mailbox.Name] >= mailbox.StallAfterSelectCount {
-				time.Sleep(mailbox.StallSelect)
+			selectCount := s.selectCounts[mailbox.Name]
+			existsCount := len(mailbox.Messages)
+			selectedMailbox = mailbox.Name
+			shouldStall := mailbox.StallSelect > 0 && selectCount >= mailbox.StallAfterSelectCount
+			stallDuration := mailbox.StallSelect
+			s.mu.Unlock()
+			if shouldStall {
+				time.Sleep(stallDuration)
 			}
-			s.selected = mailbox.Name
-			if _, err := fmt.Fprintf(writer, "* %d EXISTS\r\n", len(mailbox.Messages)); err != nil {
+			if _, err := fmt.Fprintf(writer, "* %d EXISTS\r\n", existsCount); err != nil {
 				t.Logf("SELECT EXISTS response error = %v", err)
 				return
 			}
@@ -1843,7 +1852,7 @@ func (s *fakeIMAPServer) handleConn(t *testing.T, conn net.Conn) {
 			if s.stallSearch > 0 {
 				time.Sleep(s.stallSearch)
 			}
-			sequenceNumbers, err := s.searchMessages(s.selected, args)
+			sequenceNumbers, err := s.searchMessages(selectedMailbox, args)
 			if err != nil {
 				if _, writeErr := fmt.Fprintf(writer, "%s NO %s\r\n", tag, err); writeErr != nil {
 					t.Logf("SEARCH NO response error = %v", writeErr)
@@ -1873,7 +1882,7 @@ func (s *fakeIMAPServer) handleConn(t *testing.T, conn net.Conn) {
 				return
 			}
 		case "STORE":
-			if err := s.storeDeletedFlags(s.selected, args); err != nil {
+			if err := s.storeDeletedFlags(selectedMailbox, args); err != nil {
 				if _, writeErr := fmt.Fprintf(writer, "%s NO %s\r\n", tag, err); writeErr != nil {
 					t.Logf("STORE NO response error = %v", writeErr)
 					return
@@ -1896,7 +1905,7 @@ func (s *fakeIMAPServer) handleConn(t *testing.T, conn net.Conn) {
 			subCommand := strings.ToUpper(uidParts[0])
 			switch subCommand {
 			case "SEARCH":
-				uids, err := s.searchMessageUIDs(s.selected, uidParts[1])
+				uids, err := s.searchMessageUIDs(selectedMailbox, uidParts[1])
 				if err != nil {
 					if _, writeErr := fmt.Fprintf(writer, "%s NO %s\r\n", tag, err); writeErr != nil {
 						t.Logf("UID SEARCH NO response error = %v", writeErr)
@@ -1925,14 +1934,14 @@ func (s *fakeIMAPServer) handleConn(t *testing.T, conn net.Conn) {
 					return
 				}
 			case "FETCH":
-				if err := s.writeUIDFetchResponse(writer, tag, s.selected, uidParts[1]); err != nil {
+				if err := s.writeUIDFetchResponse(writer, tag, selectedMailbox, uidParts[1]); err != nil {
 					if _, writeErr := fmt.Fprintf(writer, "%s NO %s\r\n", tag, err); writeErr != nil {
 						t.Logf("UID FETCH NO response error = %v", writeErr)
 						return
 					}
 				}
 			case "STORE":
-				if err := s.storeDeletedFlagsByUID(s.selected, uidParts[1]); err != nil {
+				if err := s.storeDeletedFlagsByUID(selectedMailbox, uidParts[1]); err != nil {
 					if _, writeErr := fmt.Fprintf(writer, "%s NO %s\r\n", tag, err); writeErr != nil {
 						t.Logf("UID STORE NO response error = %v", writeErr)
 						return
@@ -1944,7 +1953,7 @@ func (s *fakeIMAPServer) handleConn(t *testing.T, conn net.Conn) {
 					return
 				}
 			case "MOVE":
-				if err := s.moveMessagesByUID(s.selected, uidParts[1]); err != nil {
+				if err := s.moveMessagesByUID(selectedMailbox, uidParts[1]); err != nil {
 					if _, writeErr := fmt.Fprintf(writer, "%s NO %s\r\n", tag, err); writeErr != nil {
 						t.Logf("UID MOVE NO response error = %v", writeErr)
 						return
@@ -1962,7 +1971,7 @@ func (s *fakeIMAPServer) handleConn(t *testing.T, conn net.Conn) {
 				}
 			}
 		case "EXPUNGE":
-			if err := s.expungeMailbox(s.selected); err != nil {
+			if err := s.expungeMailbox(selectedMailbox); err != nil {
 				if _, writeErr := fmt.Fprintf(writer, "%s NO %s\r\n", tag, err); writeErr != nil {
 					t.Logf("EXPUNGE NO response error = %v", writeErr)
 					return
@@ -1974,7 +1983,7 @@ func (s *fakeIMAPServer) handleConn(t *testing.T, conn net.Conn) {
 				return
 			}
 		case "FETCH":
-			if err := s.writeFetchResponse(writer, tag, s.selected, args); err != nil {
+			if err := s.writeFetchResponse(writer, tag, selectedMailbox, args); err != nil {
 				if _, writeErr := fmt.Fprintf(writer, "%s NO %s\r\n", tag, err); writeErr != nil {
 					t.Logf("FETCH NO response error = %v", writeErr)
 					return
@@ -2008,6 +2017,9 @@ func (s *fakeIMAPServer) handleConn(t *testing.T, conn net.Conn) {
 }
 
 func (s *fakeIMAPServer) writeListResponse(writer *bufio.Writer, tag string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	for _, mailbox := range s.mailboxes {
 		flags := ""
 		if mailbox.NoSelect {
@@ -2031,7 +2043,7 @@ func (s *fakeIMAPServer) writeListResponse(writer *bufio.Writer, tag string) err
 	return nil
 }
 
-func (s *fakeIMAPServer) findMailbox(args []string) (*fakeIMAPMailbox, bool) {
+func (s *fakeIMAPServer) findMailboxLocked(args []string) (*fakeIMAPMailbox, bool) {
 	if len(args) != 1 {
 		return nil, false
 	}
@@ -2046,7 +2058,14 @@ func (s *fakeIMAPServer) findMailbox(args []string) (*fakeIMAPMailbox, bool) {
 }
 
 func (s *fakeIMAPServer) searchMessages(mailboxName, criteria string) ([]int, error) {
-	mailbox, ok := s.findMailbox([]string{mailboxName})
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return s.searchMessagesLocked(mailboxName, criteria)
+}
+
+func (s *fakeIMAPServer) searchMessagesLocked(mailboxName, criteria string) ([]int, error) {
+	mailbox, ok := s.findMailboxLocked([]string{mailboxName})
 	if !ok {
 		return nil, fmt.Errorf("no selected mailbox")
 	}
@@ -2124,12 +2143,15 @@ func (s *fakeIMAPServer) searchMessages(mailboxName, criteria string) ([]int, er
 }
 
 func (s *fakeIMAPServer) searchMessageUIDs(mailboxName, criteria string) ([]uint32, error) {
-	sequenceNumbers, err := s.searchMessages(mailboxName, criteria)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	sequenceNumbers, err := s.searchMessagesLocked(mailboxName, criteria)
 	if err != nil {
 		return nil, err
 	}
 
-	mailbox, ok := s.findMailbox([]string{mailboxName})
+	mailbox, ok := s.findMailboxLocked([]string{mailboxName})
 	if !ok {
 		return nil, fmt.Errorf("no selected mailbox")
 	}
@@ -2146,7 +2168,10 @@ func (s *fakeIMAPServer) searchMessageUIDs(mailboxName, criteria string) ([]uint
 }
 
 func (s *fakeIMAPServer) writeFetchResponse(writer *bufio.Writer, tag, mailboxName, args string) error {
-	mailbox, ok := s.findMailbox([]string{mailboxName})
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	mailbox, ok := s.findMailboxLocked([]string{mailboxName})
 	if !ok {
 		return fmt.Errorf("no selected mailbox")
 	}
@@ -2218,7 +2243,10 @@ func (s *fakeIMAPServer) writeFetchResponse(writer *bufio.Writer, tag, mailboxNa
 }
 
 func (s *fakeIMAPServer) writeUIDFetchResponse(writer *bufio.Writer, tag, mailboxName, args string) error {
-	mailbox, ok := s.findMailbox([]string{mailboxName})
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	mailbox, ok := s.findMailboxLocked([]string{mailboxName})
 	if !ok {
 		return fmt.Errorf("no selected mailbox")
 	}
@@ -2286,7 +2314,10 @@ func (s *fakeIMAPServer) writeUIDFetchResponse(writer *bufio.Writer, tag, mailbo
 }
 
 func (s *fakeIMAPServer) storeDeletedFlags(mailboxName, args string) error {
-	mailbox, ok := s.findMailbox([]string{mailboxName})
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	mailbox, ok := s.findMailboxLocked([]string{mailboxName})
 	if !ok {
 		return fmt.Errorf("no selected mailbox")
 	}
@@ -2330,7 +2361,10 @@ func (s *fakeIMAPServer) storeDeletedFlags(mailboxName, args string) error {
 }
 
 func (s *fakeIMAPServer) storeDeletedFlagsByUID(mailboxName, args string) error {
-	mailbox, ok := s.findMailbox([]string{mailboxName})
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	mailbox, ok := s.findMailboxLocked([]string{mailboxName})
 	if !ok {
 		return fmt.Errorf("no selected mailbox")
 	}
@@ -2374,7 +2408,10 @@ func (s *fakeIMAPServer) storeDeletedFlagsByUID(mailboxName, args string) error 
 }
 
 func (s *fakeIMAPServer) moveMessagesByUID(mailboxName, args string) error {
-	sourceMailbox, ok := s.findMailbox([]string{mailboxName})
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	sourceMailbox, ok := s.findMailboxLocked([]string{mailboxName})
 	if !ok {
 		return fmt.Errorf("no selected mailbox")
 	}
@@ -2397,7 +2434,7 @@ func (s *fakeIMAPServer) moveMessagesByUID(mailboxName, args string) error {
 		return fmt.Errorf("invalid UID MOVE mailbox args: %s", args)
 	}
 
-	targetMailbox, ok := s.findMailbox(moveArgs)
+	targetMailbox, ok := s.findMailboxLocked(moveArgs)
 	if !ok {
 		return fmt.Errorf("target mailbox %s not found", moveArgs[0])
 	}
@@ -2428,7 +2465,10 @@ func (s *fakeIMAPServer) moveMessagesByUID(mailboxName, args string) error {
 }
 
 func (s *fakeIMAPServer) expungeMailbox(mailboxName string) error {
-	mailbox, ok := s.findMailbox([]string{mailboxName})
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	mailbox, ok := s.findMailboxLocked([]string{mailboxName})
 	if !ok {
 		return fmt.Errorf("no selected mailbox")
 	}
@@ -2449,7 +2489,7 @@ func (s *fakeIMAPServer) expungeMailbox(mailboxName string) error {
 	mailbox.Messages = filtered
 
 	if mailbox.DeleteMovesTo != "" && len(movedMessages) > 0 {
-		targetMailbox, ok := s.findMailbox([]string{mailbox.DeleteMovesTo})
+		targetMailbox, ok := s.findMailboxLocked([]string{mailbox.DeleteMovesTo})
 		if !ok {
 			return fmt.Errorf("target mailbox %s not found", mailbox.DeleteMovesTo)
 		}

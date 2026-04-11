@@ -87,11 +87,21 @@ func (a *App) Run(ctx context.Context) error {
 	}
 
 	results := make(chan accountRunResult, len(accounts))
+	var sem chan struct{}
+	if a.Concurrency > 0 {
+		sem = make(chan struct{}, a.Concurrency)
+	}
 	var wg sync.WaitGroup
 	for _, account := range accounts {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
+			if sem != nil {
+				sem <- struct{}{}
+				defer func() {
+					<-sem
+				}()
+			}
 
 			runCtx, cancel := context.WithTimeout(ctx, timeout)
 			defer cancel()

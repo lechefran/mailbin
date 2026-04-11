@@ -19,3 +19,6 @@ accounts.json
 
 # Repository-local skills
 skills/
+
+# Repository-local agents
+agents.md

@@ -30,13 +30,15 @@ const (
 	imapAddressZoho      = "imap.zoho.com:993"
 
 	maxDeletePasses          = 3
-	maxDeleteMailboxAttempts = 3
+	maxDeleteMailboxAttempts = 5
+	maxDeleteCommandRetries  = 5
+	maxDeleteStoreRetries    = 5
+	maxDeleteExpungeRetries  = 5
 	maxMailboxCommandRetries = 3
 	maxFetchRetryAttempts    = 3
-	maxStoreRetryAttempts    = 3
-	maxExpungeRetryAttempts  = 3
 	defaultFetchBatchSize    = 20
 	defaultDeleteBatchSize   = 20
+	deleteRetryBackoff       = time.Second
 )
 
 type ADDR string
@@ -462,11 +464,11 @@ func (s *IMAPSession) deleteMailboxWithRetry(mailbox string, format string, args
 attemptLoop:
 	for attempt := 0; attempt < maxDeleteMailboxAttempts; attempt++ {
 		log.Printf("delete mailbox %s: attempt %d", mailbox, attempt+1)
-		if err := s.selectMailboxWithRetry(mailbox); err != nil {
+		if err := s.deleteSelectMailboxWithRetry(mailbox); err != nil {
 			return deletedSummaries, movedToTrashCount, false, err
 		}
 
-		uids, err := s.searchUIDsWithRetry(mailbox, format, args...)
+		uids, err := s.deleteSearchUIDsWithRetry(mailbox, format, args...)
 		if err != nil {
 			return deletedSummaries, movedToTrashCount, false, fmt.Errorf("search mailbox %s: %w", mailbox, err)
 		}
@@ -509,6 +511,10 @@ attemptLoop:
 
 				lastTimeoutErr = err
 				log.Printf("retrying mailbox %s delete after timeout: %v", mailbox, err)
+				if attempt == maxDeleteMailboxAttempts-1 {
+					continue attemptLoop
+				}
+				sleepRetryBackoff(deleteRetryBackoff)
 				if reconnectErr := s.reconnectAndSelectMailbox(mailbox); reconnectErr != nil {
 					return deletedSummaries, movedToTrashCount, true, reconnectErr
 				}
@@ -786,7 +792,7 @@ func (s *IMAPSession) deleteSelectedMailboxMessages(summaries []EmailSummary) ([
 
 func (s *IMAPSession) storeDeletedFlagByUIDWithRetry(summary EmailSummary) error {
 	var lastErr error
-	for attempt := 0; attempt < maxStoreRetryAttempts; attempt++ {
+	for attempt := 0; attempt < maxDeleteStoreRetries; attempt++ {
 		err := s.storeDeletedFlagByUID(summary.UID)
 		if err == nil {
 			return nil
@@ -801,12 +807,13 @@ func (s *IMAPSession) storeDeletedFlagByUIDWithRetry(summary EmailSummary) error
 			summary.Mailbox,
 			summary.UID,
 			attempt+1,
-			maxStoreRetryAttempts,
+			maxDeleteStoreRetries,
 			err,
 		)
-		if attempt == maxStoreRetryAttempts-1 {
+		if attempt == maxDeleteStoreRetries-1 {
 			break
 		}
+		sleepRetryBackoff(deleteRetryBackoff)
 		if err := s.reconnectAndSelectMailbox(summary.Mailbox); err != nil {
 			return err
 		}
@@ -844,7 +851,7 @@ func (s *IMAPSession) moveMessageToTrashByUID(uid uint32, trashMailbox string) e
 
 func (s *IMAPSession) moveMessageToTrashByUIDWithRetry(summary EmailSummary, trashMailbox string) (bool, error) {
 	var lastErr error
-	for attempt := 0; attempt < maxStoreRetryAttempts; attempt++ {
+	for attempt := 0; attempt < maxDeleteStoreRetries; attempt++ {
 		err := s.moveMessageToTrashByUID(summary.UID, trashMailbox)
 		if err == nil {
 			return true, nil
@@ -867,12 +874,13 @@ func (s *IMAPSession) moveMessageToTrashByUIDWithRetry(summary EmailSummary, tra
 			summary.Mailbox,
 			summary.UID,
 			attempt+1,
-			maxStoreRetryAttempts,
+			maxDeleteStoreRetries,
 			err,
 		)
-		if attempt == maxStoreRetryAttempts-1 {
+		if attempt == maxDeleteStoreRetries-1 {
 			break
 		}
+		sleepRetryBackoff(deleteRetryBackoff)
 		if err := s.reconnectAndSelectMailbox(summary.Mailbox); err != nil {
 			return false, err
 		}
@@ -898,7 +906,7 @@ func (s *IMAPSession) reconnectAndSelectMailbox(mailbox string) error {
 
 func (s *IMAPSession) expungeMailboxWithRetry(mailbox string) error {
 	var lastErr error
-	for attempt := 0; attempt < maxExpungeRetryAttempts; attempt++ {
+	for attempt := 0; attempt < maxDeleteExpungeRetries; attempt++ {
 		_, _, err := s.runCommand("EXPUNGE")
 		if err == nil {
 			return nil
@@ -912,12 +920,13 @@ func (s *IMAPSession) expungeMailboxWithRetry(mailbox string) error {
 			"retrying EXPUNGE for mailbox %s after timeout (attempt %d/%d): %v",
 			mailbox,
 			attempt+1,
-			maxExpungeRetryAttempts,
+			maxDeleteExpungeRetries,
 			err,
 		)
-		if attempt == maxExpungeRetryAttempts-1 {
+		if attempt == maxDeleteExpungeRetries-1 {
 			break
 		}
+		sleepRetryBackoff(deleteRetryBackoff)
 		if err := s.reconnectAndSelectMailbox(mailbox); err != nil {
 			return err
 		}
@@ -1005,8 +1014,16 @@ func (s *IMAPSession) selectMailbox(mailbox string) error {
 }
 
 func (s *IMAPSession) selectMailboxWithRetry(mailbox string) error {
+	return s.selectMailboxWithRetryConfig(mailbox, maxMailboxCommandRetries, 0)
+}
+
+func (s *IMAPSession) deleteSelectMailboxWithRetry(mailbox string) error {
+	return s.selectMailboxWithRetryConfig(mailbox, maxDeleteCommandRetries, deleteRetryBackoff)
+}
+
+func (s *IMAPSession) selectMailboxWithRetryConfig(mailbox string, maxAttempts int, backoff time.Duration) error {
 	var lastErr error
-	for attempt := 0; attempt < maxMailboxCommandRetries; attempt++ {
+	for attempt := 0; attempt < maxAttempts; attempt++ {
 		if err := s.selectMailbox(mailbox); err == nil {
 			return nil
 		} else if !isRetryableConnectionError(err) {
@@ -1019,12 +1036,13 @@ func (s *IMAPSession) selectMailboxWithRetry(mailbox string) error {
 			"retrying SELECT for mailbox %s after retryable connection error (attempt %d/%d): %v",
 			mailbox,
 			attempt+1,
-			maxMailboxCommandRetries,
+			maxAttempts,
 			lastErr,
 		)
-		if attempt == maxMailboxCommandRetries-1 {
+		if attempt == maxAttempts-1 {
 			break
 		}
+		sleepRetryBackoff(backoff)
 		if err := s.reconnect(); err != nil {
 			return err
 		}
@@ -1235,9 +1253,13 @@ func expandIDRange(segment string) []uint32 {
 	return ids
 }
 
-func (s *IMAPSession) searchUIDsWithRetry(mailbox string, format string, args ...any) ([]uint32, error) {
+func (s *IMAPSession) deleteSearchUIDsWithRetry(mailbox string, format string, args ...any) ([]uint32, error) {
+	return s.searchUIDsWithRetryConfig(mailbox, maxDeleteCommandRetries, deleteRetryBackoff, format, args...)
+}
+
+func (s *IMAPSession) searchUIDsWithRetryConfig(mailbox string, maxAttempts int, backoff time.Duration, format string, args ...any) ([]uint32, error) {
 	var lastErr error
-	for attempt := 0; attempt < maxMailboxCommandRetries; attempt++ {
+	for attempt := 0; attempt < maxAttempts; attempt++ {
 		uids, err := s.searchUIDs(format, args...)
 		if err == nil {
 			return uids, nil
@@ -1251,12 +1273,13 @@ func (s *IMAPSession) searchUIDsWithRetry(mailbox string, format string, args ..
 			"retrying UID SEARCH for mailbox %s after retryable connection error (attempt %d/%d): %v",
 			mailbox,
 			attempt+1,
-			maxMailboxCommandRetries,
+			maxAttempts,
 			err,
 		)
-		if attempt == maxMailboxCommandRetries-1 {
+		if attempt == maxAttempts-1 {
 			break
 		}
+		sleepRetryBackoff(backoff)
 		if reconnectErr := s.reconnectAndSelectMailbox(mailbox); reconnectErr != nil {
 			return nil, reconnectErr
 		}
@@ -1267,6 +1290,14 @@ func (s *IMAPSession) searchUIDsWithRetry(mailbox string, format string, args ..
 	}
 
 	return nil, fmt.Errorf("uid search mailbox %s failed", mailbox)
+}
+
+func sleepRetryBackoff(delay time.Duration) {
+	if delay <= 0 {
+		return
+	}
+
+	time.Sleep(delay)
 }
 
 func (s *IMAPSession) fetchEmailSummaries(mailbox string, sequenceNumbers []int) ([]EmailSummary, error) {

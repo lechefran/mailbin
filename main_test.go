@@ -401,6 +401,74 @@ func TestAppRunDeleteMultipleAccountsRunsConcurrentlyAndAggregatesCount(t *testi
 	}
 }
 
+func TestAppRunDeleteHonorsConcurrencyLimit(t *testing.T) {
+	buffer := &bytes.Buffer{}
+	started := make(chan string, 2)
+	release := make(chan struct{})
+	errs := make(chan error, 1)
+
+	app := &App{
+		Accounts: []ConfiguredAccount{
+			{
+				Name: "gmail",
+				Client: &IMAPClient{
+					Address: "imap.gmail.com:993",
+					Email:   "one@example.com",
+				},
+			},
+			{
+				Name: "icloud",
+				Client: &IMAPClient{
+					Address: "imap.mail.me.com:993",
+					Email:   "two@example.com",
+				},
+			},
+		},
+		Login: func(_ context.Context, client *IMAPClient) (SessionWithInboxRead, error) {
+			return &blockingDeleteSession{
+				email:   client.Email,
+				started: started,
+				release: release,
+				emails: []EmailSummary{
+					{
+						UID:     1,
+						Mailbox: "INBOX",
+						Subject: client.Email,
+					},
+				},
+			}, nil
+		},
+		Action:         "delete",
+		Age:            90,
+		IncludeFlagged: false,
+		Concurrency:    1,
+		Timeout:        time.Second,
+		Output:         buffer,
+	}
+
+	go func() {
+		errs <- app.Run(context.Background())
+	}()
+
+	first := <-started
+	select {
+	case second := <-started:
+		t.Fatalf("started accounts = %q and %q, want only one account to start before release", first, second)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	close(release)
+
+	second := <-started
+	if first == second {
+		t.Fatalf("started accounts = %q and %q, want distinct accounts", first, second)
+	}
+
+	if err := <-errs; err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+}
+
 func TestAppRunReadMultipleAccountsRunsConcurrentlyAndAggregatesCount(t *testing.T) {
 	buffer := &bytes.Buffer{}
 	started := make(chan string, 2)
