@@ -13,7 +13,7 @@
       "password_env": "MAILBIN_ICLOUD_PASSWORD"
     },
     {
-      "name": "custom-host",
+      "name": "outlook",
       "email": "you@example.com",
       "imap_addr": "imap.example.com:993",
       "password_env": "MAILBIN_CUSTOM_PASSWORD"

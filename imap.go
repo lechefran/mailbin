@@ -1,4 +1,4 @@
-package main
+package mailbin
 
 import (
 	"bufio"
@@ -110,7 +110,7 @@ type imapResponseLine struct {
 var fetchBatchSize = defaultFetchBatchSize
 var deleteBatchSize = defaultDeleteBatchSize
 
-func resolveIMAPAddress(provider string, address string) (string, error) {
+func ResolveIMAPAddress(provider string, address string) (string, error) {
 	address = strings.TrimSpace(address)
 	if address != "" {
 		return address, nil

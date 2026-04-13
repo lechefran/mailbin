@@ -1,7 +1,6 @@
-package main
+package mailbin
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"net"
@@ -52,8 +51,7 @@ func TestAppDeleteByAgeRequiresAge(t *testing.T) {
 	}
 }
 
-func TestAppRunDeletePrintsEmailsAndCount(t *testing.T) {
-	buffer := &bytes.Buffer{}
+func TestAppRunReturnsDeleteResults(t *testing.T) {
 	session := &stubDeleteSession{
 		emails: []EmailSummary{
 			{
@@ -88,22 +86,20 @@ func TestAppRunDeletePrintsEmailsAndCount(t *testing.T) {
 		Now: func() time.Time {
 			return time.Date(2026, time.April, 1, 12, 0, 0, 0, time.UTC)
 		},
-		Output: buffer,
 	}
 
-	if err := app.Run(context.Background()); err != nil {
+	result, err := app.Run(context.Background())
+	if err != nil {
 		t.Fatalf("Run() error = %v", err)
 	}
-
-	output := buffer.String()
-	if !strings.Contains(output, "Today message") {
-		t.Fatalf("Run() output = %q, want first subject", output)
+	if len(result.Emails) != 2 {
+		t.Fatalf("Run() emails = %v, want 2 deleted emails", result.Emails)
 	}
-	if !strings.Contains(output, "Spam message") {
-		t.Fatalf("Run() output = %q, want second subject", output)
+	if result.TotalAccounts != 1 {
+		t.Fatalf("Run() total accounts = %d, want 1", result.TotalAccounts)
 	}
-	if !strings.Contains(output, "deleted 2 emails") {
-		t.Fatalf("Run() output = %q, want deleted count", output)
+	if len(result.Failures) != 0 {
+		t.Fatalf("Run() failures = %v, want none", result.Failures)
 	}
 	if session.calledAge != 0 {
 		t.Fatalf("Run() age = %d, want 0", session.calledAge)
@@ -113,8 +109,7 @@ func TestAppRunDeletePrintsEmailsAndCount(t *testing.T) {
 	}
 }
 
-func TestAppRunMultipleAccountsAggregatesOutput(t *testing.T) {
-	buffer := &bytes.Buffer{}
+func TestAppRunMultipleAccountsAggregatesResults(t *testing.T) {
 	sessions := map[string]*stubDeleteSession{
 		"one@example.com": {
 			emails: []EmailSummary{{UID: 1, Subject: "First account message"}},
@@ -146,25 +141,23 @@ func TestAppRunMultipleAccountsAggregatesOutput(t *testing.T) {
 		},
 		Age:     90,
 		Timeout: time.Second,
-		Output:  buffer,
 	}
 
-	if err := app.Run(context.Background()); err != nil {
+	result, err := app.Run(context.Background())
+	if err != nil {
 		t.Fatalf("Run() error = %v", err)
 	}
-
-	output := buffer.String()
-	if !strings.Contains(output, "account=gmail |") {
-		t.Fatalf("Run() output = %q, want gmail account label", output)
+	if result.TotalAccounts != 2 {
+		t.Fatalf("Run() total accounts = %d, want 2", result.TotalAccounts)
 	}
-	if !strings.Contains(output, "account=icloud |") {
-		t.Fatalf("Run() output = %q, want icloud account label", output)
+	if result.SuccessfulAccounts() != 2 {
+		t.Fatalf("Run() successful accounts = %d, want 2", result.SuccessfulAccounts())
 	}
-	if strings.Count(output, "deleted 2 emails") != 1 {
-		t.Fatalf("Run() output = %q, want one aggregated summary", output)
+	if len(result.Emails) != 2 {
+		t.Fatalf("Run() emails = %v, want 2 deleted emails", result.Emails)
 	}
-	if !strings.Contains(output, "summary: deleted total=2 emails across accounts=2 (successful=2 failed=0)") {
-		t.Fatalf("Run() output = %q, want cross-account delete summary", output)
+	if result.Emails[0].Account == "" || result.Emails[1].Account == "" {
+		t.Fatalf("Run() emails = %v, want account names populated", result.Emails)
 	}
 	if !sessions["one@example.com"].loggedOut || !sessions["two@example.com"].loggedOut {
 		t.Fatalf("sessions logged out = %#v", sessions)
@@ -172,10 +165,10 @@ func TestAppRunMultipleAccountsAggregatesOutput(t *testing.T) {
 }
 
 func TestAppRunDeleteMultipleAccountsRunsConcurrentlyAndAggregatesCount(t *testing.T) {
-	buffer := &bytes.Buffer{}
 	started := make(chan string, 2)
 	release := make(chan struct{})
 	errs := make(chan error, 1)
+	results := make(chan *RunResult, 1)
 
 	app := &App{
 		Accounts: []ConfiguredAccount{
@@ -211,11 +204,12 @@ func TestAppRunDeleteMultipleAccountsRunsConcurrentlyAndAggregatesCount(t *testi
 		Age:         90,
 		Concurrency: 2,
 		Timeout:     time.Second,
-		Output:      buffer,
 	}
 
 	go func() {
-		errs <- app.Run(context.Background())
+		result, err := app.Run(context.Background())
+		results <- result
+		errs <- err
 	}()
 
 	first := <-started
@@ -225,27 +219,16 @@ func TestAppRunDeleteMultipleAccountsRunsConcurrentlyAndAggregatesCount(t *testi
 	}
 	close(release)
 
+	result := <-results
 	if err := <-errs; err != nil {
 		t.Fatalf("Run() error = %v", err)
 	}
-
-	output := buffer.String()
-	if !strings.Contains(output, "account=gmail |") {
-		t.Fatalf("Run() output = %q, want gmail account label", output)
-	}
-	if !strings.Contains(output, "account=icloud |") {
-		t.Fatalf("Run() output = %q, want icloud account label", output)
-	}
-	if !strings.Contains(output, "deleted 2 emails") {
-		t.Fatalf("Run() output = %q, want aggregated deleted count", output)
-	}
-	if !strings.Contains(output, "summary: deleted total=2 emails across accounts=2 (successful=2 failed=0)") {
-		t.Fatalf("Run() output = %q, want cross-account delete summary", output)
+	if len(result.Emails) != 2 {
+		t.Fatalf("Run() emails = %v, want aggregated deleted count of 2", result.Emails)
 	}
 }
 
 func TestAppRunDeleteHonorsConcurrencyLimit(t *testing.T) {
-	buffer := &bytes.Buffer{}
 	started := make(chan string, 2)
 	release := make(chan struct{})
 	errs := make(chan error, 1)
@@ -284,11 +267,11 @@ func TestAppRunDeleteHonorsConcurrencyLimit(t *testing.T) {
 		Age:         90,
 		Concurrency: 1,
 		Timeout:     time.Second,
-		Output:      buffer,
 	}
 
 	go func() {
-		errs <- app.Run(context.Background())
+		_, err := app.Run(context.Background())
+		errs <- err
 	}()
 
 	first := <-started
@@ -310,9 +293,7 @@ func TestAppRunDeleteHonorsConcurrencyLimit(t *testing.T) {
 	}
 }
 
-func TestAppRunDoesNotPrintEmptySummaryWhenAllAccountsFail(t *testing.T) {
-	buffer := &bytes.Buffer{}
-
+func TestAppRunReturnsAggregatedFailureWhenAllAccountsFail(t *testing.T) {
 	app := &App{
 		Accounts: []ConfiguredAccount{
 			{
@@ -335,23 +316,27 @@ func TestAppRunDoesNotPrintEmptySummaryWhenAllAccountsFail(t *testing.T) {
 		},
 		Age:     90,
 		Timeout: time.Second,
-		Output:  buffer,
 	}
 
-	err := app.Run(context.Background())
+	result, err := app.Run(context.Background())
 	if err == nil {
 		t.Fatal("Run() error = nil, want failure")
 	}
 	if !strings.Contains(err.Error(), "2 account(s) failed") {
 		t.Fatalf("Run() error = %v, want aggregated failure", err)
 	}
-	if buffer.Len() != 0 {
-		t.Fatalf("Run() output = %q, want no empty summary", buffer.String())
+	if result == nil {
+		t.Fatal("Run() result = nil, want failure details")
+	}
+	if len(result.Emails) != 0 {
+		t.Fatalf("Run() emails = %v, want none", result.Emails)
+	}
+	if len(result.Failures) != 2 {
+		t.Fatalf("Run() failures = %v, want 2", result.Failures)
 	}
 }
 
 func TestAppRunIgnoresLogoutTimeoutAfterSuccessfulDelete(t *testing.T) {
-	buffer := &bytes.Buffer{}
 	app := &App{
 		Client: &IMAPClient{
 			Address: "imap.example.com:993",
@@ -368,79 +353,14 @@ func TestAppRunIgnoresLogoutTimeoutAfterSuccessfulDelete(t *testing.T) {
 		},
 		Age:     90,
 		Timeout: time.Second,
-		Output:  buffer,
 	}
 
-	if err := app.Run(context.Background()); err != nil {
+	result, err := app.Run(context.Background())
+	if err != nil {
 		t.Fatalf("Run() error = %v", err)
 	}
-
-	output := buffer.String()
-	if !strings.Contains(output, "Old message") {
-		t.Fatalf("Run() output = %q, want deleted message", output)
-	}
-	if !strings.Contains(output, "deleted 1 emails") {
-		t.Fatalf("Run() output = %q, want delete summary", output)
-	}
-}
-
-func TestResolvePassword(t *testing.T) {
-	testCases := []struct {
-		name          string
-		input         string
-		envValue      string
-		interactive   bool
-		wantPassword  string
-		wantPrompt    string
-		wantErrorText string
-	}{
-		{
-			name:         "uses env password",
-			envValue:     "env-secret",
-			interactive:  false,
-			wantPassword: "env-secret",
-		},
-		{
-			name:         "prompts on interactive stdin",
-			input:        "typed-secret\n",
-			interactive:  true,
-			wantPassword: "typed-secret",
-			wantPrompt:   "Enter IMAP password: ",
-		},
-		{
-			name:          "errors on non interactive stdin",
-			interactive:   false,
-			wantErrorText: "MAILBIN_PASSWORD is required",
-		},
-	}
-
-	for _, testCase := range testCases {
-		t.Run(testCase.name, func(t *testing.T) {
-			prompt := &bytes.Buffer{}
-			password, err := resolvePassword(
-				strings.NewReader(testCase.input),
-				prompt,
-				func(string) string { return testCase.envValue },
-				testCase.interactive,
-			)
-
-			if testCase.wantErrorText != "" {
-				if err == nil || !strings.Contains(err.Error(), testCase.wantErrorText) {
-					t.Fatalf("resolvePassword() error = %v, want %q", err, testCase.wantErrorText)
-				}
-				return
-			}
-
-			if err != nil {
-				t.Fatalf("resolvePassword() error = %v", err)
-			}
-			if password != testCase.wantPassword {
-				t.Fatalf("resolvePassword() password = %q, want %q", password, testCase.wantPassword)
-			}
-			if prompt.String() != testCase.wantPrompt {
-				t.Fatalf("resolvePassword() prompt = %q, want %q", prompt.String(), testCase.wantPrompt)
-			}
-		})
+	if len(result.Emails) != 1 {
+		t.Fatalf("Run() emails = %v, want deleted message", result.Emails)
 	}
 }
 

@@ -7,6 +7,8 @@ import (
 	"io"
 	"os"
 	"strings"
+
+	"github.com/lechefran/mailbin"
 )
 
 type accountsConfig struct {
@@ -28,14 +30,14 @@ func loadConfiguredAccounts(
 	prompt io.Writer,
 	getenv func(string) string,
 	interactive bool,
-) ([]ConfiguredAccount, error) {
+) ([]mailbin.ConfiguredAccount, error) {
 	config, err := readAccountsConfig(configPath)
 	if err != nil {
 		return nil, err
 	}
 
 	selectedAccount = strings.TrimSpace(selectedAccount)
-	var accounts []ConfiguredAccount
+	var accounts []mailbin.ConfiguredAccount
 	for _, configured := range config.Accounts {
 		name := strings.TrimSpace(configured.Name)
 		if name == "" {
@@ -46,7 +48,7 @@ func loadConfiguredAccounts(
 			continue
 		}
 
-		address, err := resolveIMAPAddress(configured.Provider, configured.IMAPAddr)
+		address, err := mailbin.ResolveIMAPAddress(configured.Provider, configured.IMAPAddr)
 		if err != nil {
 			return nil, fmt.Errorf("account %q: %w", name, err)
 		}
@@ -56,9 +58,9 @@ func loadConfiguredAccounts(
 			return nil, fmt.Errorf("account %q: %w", name, err)
 		}
 
-		accounts = append(accounts, ConfiguredAccount{
+		accounts = append(accounts, mailbin.ConfiguredAccount{
 			Name: name,
-			Client: &IMAPClient{
+			Client: &mailbin.IMAPClient{
 				Provider: strings.TrimSpace(configured.Provider),
 				Address:  address,
 				Email:    strings.TrimSpace(configured.Email),
@@ -160,4 +162,12 @@ func promptPassword(input io.Reader, prompt io.Writer, promptText string) (strin
 	}
 
 	return value, nil
+}
+
+func defaultAccountName(email string) string {
+	if email == "" {
+		return "account"
+	}
+
+	return email
 }
