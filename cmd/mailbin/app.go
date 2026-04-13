@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"strconv"
 	"strings"
@@ -172,6 +173,10 @@ func runConfiguredAccounts(ctx context.Context, options *cliOptions, deleteAccou
 }
 
 func deleteWithClient(ctx context.Context, config mailbin.Config, criteria mailbin.DeleteCriteria) (mailbin.DeleteResult, error) {
+	if config.Logf == nil {
+		config.Logf = log.Printf
+	}
+
 	client, err := mailbin.NewClient(config)
 	if err != nil {
 		return mailbin.DeleteResult{}, err

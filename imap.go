@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"net"
 	"net/mail"
 	"sort"
@@ -72,6 +71,7 @@ type Config struct {
 	Address        string
 	Email          string
 	Password       string
+	Logf           func(format string, args ...any)
 	TLSConfig      *tls.Config
 	DialTLSContext func(context.Context, string, *tls.Config) (net.Conn, error)
 	LookupIPAddrs  func(context.Context, string) ([]net.IPAddr, error)
@@ -194,6 +194,22 @@ func (c *Client) validate() error {
 	default:
 		return nil
 	}
+}
+
+func (c *Client) logf(format string, args ...any) {
+	if c == nil || c.config.Logf == nil {
+		return
+	}
+
+	c.config.Logf(format, args...)
+}
+
+func (s *session) logf(format string, args ...any) {
+	if s == nil || s.client == nil {
+		return
+	}
+
+	s.client.logf(format, args...)
 }
 
 func (c *Client) cloneTLSConfig(serverName string) *tls.Config {
@@ -336,18 +352,18 @@ deletePasses:
 			break
 		}
 		mailboxes = prioritizeDeleteMailboxes(mailboxes, s.isGmailAccount())
-		log.Printf("delete pass %d/%d: scanning %d mailboxes", pass+1, maxDeletePasses, len(mailboxes))
+		s.logf("delete pass %d/%d: scanning %d mailboxes", pass+1, maxDeletePasses, len(mailboxes))
 
 		passDeletedCount := 0
 		passMovedToTrashCount := 0
 		skippedMailboxCount := 0
 		successfulMailboxScans := 0
 		for _, mailbox := range mailboxes {
-			log.Printf("delete pass %d: scanning mailbox %s", pass+1, mailbox)
+			s.logf("delete pass %d: scanning mailbox %s", pass+1, mailbox)
 			mailboxSummaries, movedToTrashCount, hadSearchResults, err := s.deleteMailboxWithRetry(mailbox, format, args...)
 			if err != nil {
 				if isRetryableConnectionError(err) {
-					log.Printf("skipping mailbox %s after retryable connection error during delete: %v", mailbox, err)
+					s.logf("skipping mailbox %s after retryable connection error during delete: %v", mailbox, err)
 					skippedMailboxCount++
 					if reconnectErr := s.reconnect(); reconnectErr != nil {
 						if firstErr == nil && len(deletedSummaries) == 0 {
@@ -365,13 +381,13 @@ deletePasses:
 			}
 			successfulMailboxScans++
 			if !hadSearchResults {
-				log.Printf("delete pass %d: mailbox %s had no matching emails", pass+1, mailbox)
+				s.logf("delete pass %d: mailbox %s had no matching emails", pass+1, mailbox)
 				continue
 			}
 
 			passDeletedCount += len(mailboxSummaries)
 			passMovedToTrashCount += movedToTrashCount
-			log.Printf(
+			s.logf(
 				"delete pass %d: mailbox %s deleted %d emails and moved %d to trash",
 				pass+1,
 				mailbox,
@@ -383,21 +399,21 @@ deletePasses:
 
 		if successfulMailboxScans == 0 && firstErr != nil && len(deletedSummaries) == 0 {
 			if isRetryableConnectionError(firstErr) {
-				log.Printf("delete pass %d: only retryable connection errors encountered; skipping failure: %v", pass+1, firstErr)
+				s.logf("delete pass %d: only retryable connection errors encountered; skipping failure: %v", pass+1, firstErr)
 				return nil, nil
 			}
 			return nil, firstErr
 		}
 
 		if passDeletedCount == 0 && passMovedToTrashCount == 0 {
-			log.Printf(
+			s.logf(
 				"delete pass %d: no delete or move progress found; stopping (skipped_mailboxes=%d)",
 				pass+1,
 				skippedMailboxCount,
 			)
 			break
 		}
-		log.Printf(
+		s.logf(
 			"delete pass %d: deleted %d emails, moved %d emails to trash, skipped %d mailboxes",
 			pass+1,
 			passDeletedCount,
@@ -408,7 +424,7 @@ deletePasses:
 
 	if len(deletedSummaries) == 0 && firstErr != nil {
 		if isRetryableConnectionError(firstErr) {
-			log.Printf("delete completed with only retryable connection errors; returning no deletions without failing: %v", firstErr)
+			s.logf("delete completed with only retryable connection errors; returning no deletions without failing: %v", firstErr)
 			return nil, nil
 		}
 		return nil, firstErr
@@ -417,7 +433,7 @@ deletePasses:
 	deletedSummaries = dedupeMessageSummaries(deletedSummaries)
 	remainingCount, err := s.checkDeleteCompletion(format, args...)
 	if err != nil {
-		log.Printf("delete incomplete: unable to verify all mailboxes: %v", err)
+		s.logf("delete incomplete: unable to verify all mailboxes: %v", err)
 		return deletedSummaries, fmt.Errorf("delete incomplete: unable to verify all mailboxes: %w", err)
 	}
 	if remainingCount > 0 {
@@ -442,7 +458,7 @@ func (s *session) checkDeleteCompletion(format string, args ...any) (int, error)
 				return remainingCount, fmt.Errorf("select mailbox %s for delete verification: %w", mailbox, err)
 			}
 			skippedMailboxCount++
-			log.Printf("delete verification: skipping mailbox %s after select error: %v", mailbox, err)
+			s.logf("delete verification: skipping mailbox %s after select error: %v", mailbox, err)
 			continue
 		}
 
@@ -452,7 +468,7 @@ func (s *session) checkDeleteCompletion(format string, args ...any) (int, error)
 				return remainingCount, fmt.Errorf("search mailbox %s for delete verification: %w", mailbox, err)
 			}
 			skippedMailboxCount++
-			log.Printf("delete verification: skipping mailbox %s after search error: %v", mailbox, err)
+			s.logf("delete verification: skipping mailbox %s after search error: %v", mailbox, err)
 			continue
 		}
 		if len(uids) == 0 {
@@ -465,7 +481,7 @@ func (s *session) checkDeleteCompletion(format string, args ...any) (int, error)
 				return remainingCount, fmt.Errorf("fetch mailbox %s for delete verification: %w", mailbox, err)
 			}
 			skippedMailboxCount++
-			log.Printf("delete verification: skipping mailbox %s after fetch error: %v", mailbox, err)
+			s.logf("delete verification: skipping mailbox %s after fetch error: %v", mailbox, err)
 			continue
 		}
 
@@ -481,7 +497,7 @@ func (s *session) checkDeleteCompletion(format string, args ...any) (int, error)
 		}
 
 		remainingCount += mailboxRemainingCount
-		log.Printf(
+		s.logf(
 			"delete incomplete: mailbox %s still has %d emails matching delete criteria",
 			mailbox,
 			mailboxRemainingCount,
@@ -489,7 +505,7 @@ func (s *session) checkDeleteCompletion(format string, args ...any) (int, error)
 	}
 
 	if remainingCount > 0 {
-		log.Printf(
+		s.logf(
 			"delete incomplete: %d emails still match delete criteria across account (skipped_mailboxes=%d)",
 			remainingCount,
 			skippedMailboxCount,
@@ -497,7 +513,7 @@ func (s *session) checkDeleteCompletion(format string, args ...any) (int, error)
 		return remainingCount, nil
 	}
 
-	log.Printf("delete complete: no emails matching delete criteria remain across account (skipped_mailboxes=%d)", skippedMailboxCount)
+	s.logf("delete complete: no emails matching delete criteria remain across account (skipped_mailboxes=%d)", skippedMailboxCount)
 	return 0, nil
 }
 
@@ -509,7 +525,7 @@ func (s *session) deleteMailboxWithRetry(mailbox string, format string, args ...
 
 attemptLoop:
 	for attempt := 0; attempt < maxDeleteMailboxAttempts; attempt++ {
-		log.Printf("delete mailbox %s: attempt %d", mailbox, attempt+1)
+		s.logf("delete mailbox %s: attempt %d", mailbox, attempt+1)
 		if err := s.deleteSelectMailboxWithRetry(mailbox); err != nil {
 			return deletedSummaries, movedToTrashCount, false, err
 		}
@@ -525,7 +541,7 @@ attemptLoop:
 			return nil, movedToTrashCount, false, nil
 		}
 		hadSearchResults = true
-		log.Printf("delete mailbox %s: matched %d emails", mailbox, len(uids))
+		s.logf("delete mailbox %s: matched %d emails", mailbox, len(uids))
 
 		batchSize := deleteBatchSize
 		if batchSize <= 0 {
@@ -541,7 +557,7 @@ attemptLoop:
 				end = len(uids)
 			}
 
-			log.Printf(
+			s.logf(
 				"mailbox %s: streaming delete batch %d/%d (%d uids)",
 				mailbox,
 				(start/batchSize)+1,
@@ -556,7 +572,7 @@ attemptLoop:
 				}
 
 				lastTimeoutErr = err
-				log.Printf("retrying mailbox %s delete after timeout: %v", mailbox, err)
+				s.logf("retrying mailbox %s delete after timeout: %v", mailbox, err)
 				if attempt == maxDeleteMailboxAttempts-1 {
 					continue attemptLoop
 				}
@@ -573,7 +589,7 @@ attemptLoop:
 		}
 
 		if attemptMovedToTrashCount > 0 {
-			log.Printf(
+			s.logf(
 				"delete mailbox %s: moved %d emails to trash (not counted as deleted)",
 				mailbox,
 				attemptMovedToTrashCount,
@@ -586,7 +602,7 @@ attemptLoop:
 	}
 
 	if len(deletedSummaries) > 0 || movedToTrashCount > 0 {
-		log.Printf(
+		s.logf(
 			"mailbox %s: timed out during delete but retained partial progress deleted=%d moved_to_trash=%d",
 			mailbox,
 			len(deletedSummaries),
@@ -627,7 +643,7 @@ func (s *session) deleteSelectedMailboxMessages(summaries []MessageSummary) ([]M
 			batchEnd = len(orderedSummaries)
 		}
 		batch := orderedSummaries[batchStart:batchEnd]
-		log.Printf(
+		s.logf(
 			"mailbox %s: processing delete batch %d/%d (%d emails)",
 			mailbox,
 			(batchStart/batchSize)+1,
@@ -644,7 +660,7 @@ func (s *session) deleteSelectedMailboxMessages(summaries []MessageSummary) ([]M
 			if !summary.ReceivedAt.IsZero() {
 				receivedAt = summary.ReceivedAt.Format(time.RFC3339)
 			}
-			log.Printf(
+			s.logf(
 				"deleting email mailbox=%s seq=%d uid=%d received_at=%s message_id=%q subject=%q",
 				summary.Mailbox,
 				summary.SequenceNumber,
@@ -655,7 +671,7 @@ func (s *session) deleteSelectedMailboxMessages(summaries []MessageSummary) ([]M
 			)
 
 			if summary.Flagged {
-				log.Printf(
+				s.logf(
 					"skipping email mailbox=%s seq=%d uid=%d received_at=%s message_id=%q subject=%q: flagged/starred",
 					summary.Mailbox,
 					summary.SequenceNumber,
@@ -670,7 +686,7 @@ func (s *session) deleteSelectedMailboxMessages(summaries []MessageSummary) ([]M
 			if moveToTrashFirst {
 				moved, err := s.moveMessageToTrashByUIDWithRetry(summary, gmailTrashMailbox)
 				if err != nil {
-					log.Printf(
+					s.logf(
 						"skipping email mailbox=%s seq=%d uid=%d received_at=%s message_id=%q subject=%q: move to trash failed: %v",
 						summary.Mailbox,
 						summary.SequenceNumber,
@@ -683,7 +699,7 @@ func (s *session) deleteSelectedMailboxMessages(summaries []MessageSummary) ([]M
 					continue
 				}
 				if !moved {
-					log.Printf(
+					s.logf(
 						"skipping email mailbox=%s seq=%d uid=%d received_at=%s message_id=%q subject=%q: unable to move to trash",
 						summary.Mailbox,
 						summary.SequenceNumber,
@@ -695,7 +711,7 @@ func (s *session) deleteSelectedMailboxMessages(summaries []MessageSummary) ([]M
 					continue
 				}
 
-				log.Printf(
+				s.logf(
 					"moved email to trash mailbox=%s uid=%d received_at=%s message_id=%q subject=%q",
 					summary.Mailbox,
 					summary.UID,
@@ -708,7 +724,7 @@ func (s *session) deleteSelectedMailboxMessages(summaries []MessageSummary) ([]M
 			}
 
 			if err := s.storeDeletedFlagByUIDWithRetry(summary); err != nil {
-				log.Printf(
+				s.logf(
 					"skipping email mailbox=%s seq=%d uid=%d received_at=%s message_id=%q subject=%q: store deleted flag failed: %v",
 					summary.Mailbox,
 					summary.SequenceNumber,
@@ -728,7 +744,7 @@ func (s *session) deleteSelectedMailboxMessages(summaries []MessageSummary) ([]M
 		}
 
 		if err := s.expungeMailboxWithRetry(mailbox); err != nil {
-			log.Printf(
+			s.logf(
 				"mailbox %s: expunge failed for %d pending deletes: %v",
 				mailbox,
 				len(pendingExpunge),
@@ -742,7 +758,7 @@ func (s *session) deleteSelectedMailboxMessages(summaries []MessageSummary) ([]M
 
 	if len(pendingExpunge) > 0 {
 		if err := s.expungeMailboxWithRetry(mailbox); err != nil {
-			log.Printf(
+			s.logf(
 				"skipping %d pending deletes in mailbox=%s after final expunge failure: %v",
 				len(pendingExpunge),
 				mailbox,
@@ -768,7 +784,7 @@ func (s *session) storeDeletedFlagByUIDWithRetry(summary MessageSummary) error {
 		}
 
 		lastErr = err
-		log.Printf(
+		s.logf(
 			"retrying UID STORE for mailbox %s uid=%d after timeout (attempt %d/%d): %v",
 			summary.Mailbox,
 			summary.UID,
@@ -823,7 +839,7 @@ func (s *session) moveMessageToTrashByUIDWithRetry(summary MessageSummary, trash
 			return true, nil
 		}
 		if isUnsupportedMoveError(err) {
-			log.Printf(
+			s.logf(
 				"UID MOVE unsupported for mailbox=%s uid=%d; skipping all-mail delete for this message",
 				summary.Mailbox,
 				summary.UID,
@@ -835,7 +851,7 @@ func (s *session) moveMessageToTrashByUIDWithRetry(summary MessageSummary, trash
 		}
 
 		lastErr = err
-		log.Printf(
+		s.logf(
 			"retrying UID MOVE for mailbox %s uid=%d after timeout (attempt %d/%d): %v",
 			summary.Mailbox,
 			summary.UID,
@@ -882,7 +898,7 @@ func (s *session) expungeMailboxWithRetry(mailbox string) error {
 		}
 
 		lastErr = err
-		log.Printf(
+		s.logf(
 			"retrying EXPUNGE for mailbox %s after timeout (attempt %d/%d): %v",
 			mailbox,
 			attempt+1,
@@ -917,7 +933,7 @@ func (s *session) listMailboxes() ([]string, error) {
 			return nil, fmt.Errorf("list mailboxes: %w", err)
 		}
 
-		log.Printf(
+		s.logf(
 			"retrying LIST after retryable connection error (attempt %d/%d): %v",
 			attempt+1,
 			maxMailboxCommandRetries,
@@ -998,7 +1014,7 @@ func (s *session) selectMailboxWithRetryConfig(mailbox string, maxAttempts int, 
 			lastErr = err
 		}
 
-		log.Printf(
+		s.logf(
 			"retrying SELECT for mailbox %s after retryable connection error (attempt %d/%d): %v",
 			mailbox,
 			attempt+1,
@@ -1182,7 +1198,7 @@ func (s *session) searchUIDsWithRetryConfig(mailbox string, maxAttempts int, bac
 		}
 
 		lastErr = err
-		log.Printf(
+		s.logf(
 			"retrying UID SEARCH for mailbox %s after retryable connection error (attempt %d/%d): %v",
 			mailbox,
 			attempt+1,
@@ -1271,7 +1287,7 @@ func (s *session) fetchBatchWithRetry(
 		}
 
 		lastErr = err
-		log.Printf(
+		s.logf(
 			"retrying fetch for mailbox %s after timeout (attempt %d/%d): %v",
 			mailbox,
 			attempt+1,

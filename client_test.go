@@ -2,6 +2,7 @@ package mailbin
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -106,4 +107,65 @@ func TestClientDeleteDeletesMatchingMessages(t *testing.T) {
 	if result.Deleted[0].Subject != "Old message" {
 		t.Fatalf("Delete() subject = %q, want old message", result.Deleted[0].Subject)
 	}
+}
+
+func TestClientDeleteUsesInjectedLogger(t *testing.T) {
+	server := newFakeIMAPServer(t, fakeIMAPServerConfig{
+		email:    "user@example.com",
+		password: "correct-password",
+		accept:   true,
+		mailboxes: []fakeIMAPMailbox{
+			{
+				Name: "INBOX",
+				Messages: []fakeIMAPMessage{
+					{
+						UID:        101,
+						MessageID:  "<old@example.com>",
+						ReceivedAt: time.Date(2026, time.January, 1, 8, 0, 0, 0, time.UTC),
+						Subject:    "Old message",
+						From:       "alerts@example.com",
+						To:         "user@example.com",
+					},
+				},
+			},
+		},
+	})
+	t.Cleanup(server.Close)
+
+	logs := make([]string, 0)
+	client, err := NewClient(Config{
+		Address:   server.Address(),
+		Email:     "user@example.com",
+		Password:  "correct-password",
+		TLSConfig: server.ClientTLSConfig(),
+		Logf: func(format string, args ...any) {
+			logs = append(logs, fmt.Sprintf(format, args...))
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewClient() error = %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if _, err := client.Delete(ctx, DeleteCriteria{
+		ReceivedBefore: time.Date(2026, time.February, 1, 0, 0, 0, 0, time.UTC),
+	}); err != nil {
+		t.Fatalf("Delete() error = %v", err)
+	}
+
+	if !containsLogMessage(logs, "delete pass 1/3") {
+		t.Fatalf("Delete() logs = %v, want injected logger to receive delete messages", logs)
+	}
+}
+
+func containsLogMessage(logs []string, substring string) bool {
+	for _, log := range logs {
+		if strings.Contains(log, substring) {
+			return true
+		}
+	}
+
+	return false
 }
