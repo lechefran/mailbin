@@ -16,12 +16,12 @@ func TestResolveIMAPAddress(t *testing.T) {
 		{
 			name:        "provider default",
 			provider:    "gmail",
-			wantAddress: string(GMAIL),
+			wantAddress: GMAIL,
 		},
 		{
 			name:        "provider alias",
 			provider:    "office365",
-			wantAddress: string(OUTLOOK),
+			wantAddress: OUTLOOK,
 		},
 		{
 			name:        "address override wins",

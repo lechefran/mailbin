@@ -23,7 +23,7 @@ import (
 	"time"
 )
 
-func TestIMAPClientLoginSuccess(t *testing.T) {
+func TestClientLoginSuccess(t *testing.T) {
 	server := newFakeIMAPServer(t, fakeIMAPServerConfig{
 		email:    "user@example.com",
 		password: `pa"ss\word`,
@@ -31,17 +31,19 @@ func TestIMAPClientLoginSuccess(t *testing.T) {
 	})
 	t.Cleanup(server.Close)
 
-	client := &IMAPClient{
-		Address:   server.Address(),
-		Email:     "user@example.com",
-		Password:  `pa"ss\word`,
-		TLSConfig: server.ClientTLSConfig(),
+	client := &Client{
+		config: Config{
+			Address:   server.Address(),
+			Email:     "user@example.com",
+			Password:  `pa"ss\word`,
+			TLSConfig: server.ClientTLSConfig(),
+		},
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	session, err := client.Login(ctx)
+	session, err := client.login(ctx)
 	if err != nil {
 		t.Fatalf("Login() error = %v", err)
 	}
@@ -51,7 +53,7 @@ func TestIMAPClientLoginSuccess(t *testing.T) {
 	}
 }
 
-func TestIMAPClientLoginRejected(t *testing.T) {
+func TestClientLoginRejected(t *testing.T) {
 	server := newFakeIMAPServer(t, fakeIMAPServerConfig{
 		email:    "user@example.com",
 		password: "correct-password",
@@ -59,17 +61,19 @@ func TestIMAPClientLoginRejected(t *testing.T) {
 	})
 	t.Cleanup(server.Close)
 
-	client := &IMAPClient{
-		Address:   server.Address(),
-		Email:     "user@example.com",
-		Password:  "wrong-password",
-		TLSConfig: server.ClientTLSConfig(),
+	client := &Client{
+		config: Config{
+			Address:   server.Address(),
+			Email:     "user@example.com",
+			Password:  "wrong-password",
+			TLSConfig: server.ClientTLSConfig(),
+		},
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	_, err := client.Login(ctx)
+	_, err := client.login(ctx)
 	if err == nil {
 		t.Fatal("Login() error = nil, want failure")
 	}
@@ -78,14 +82,16 @@ func TestIMAPClientLoginRejected(t *testing.T) {
 	}
 }
 
-func TestIMAPClientLoginRejectsCredentialsWithNewlines(t *testing.T) {
-	client := &IMAPClient{
-		Address:  "imap.example.com:993",
-		Email:    "user@example.com",
-		Password: "bad\npassword",
+func TestClientLoginRejectsCredentialsWithNewlines(t *testing.T) {
+	client := &Client{
+		config: Config{
+			Address:  "imap.example.com:993",
+			Email:    "user@example.com",
+			Password: "bad\npassword",
+		},
 	}
 
-	_, err := client.Login(context.Background())
+	_, err := client.login(context.Background())
 	if err == nil {
 		t.Fatal("Login() error = nil, want validation failure")
 	}
@@ -94,7 +100,7 @@ func TestIMAPClientLoginRejectsCredentialsWithNewlines(t *testing.T) {
 	}
 }
 
-func TestIMAPClientLoginFallsBackAfterDNSLookupFailure(t *testing.T) {
+func TestClientLoginFallsBackAfterDNSLookupFailure(t *testing.T) {
 	server := newFakeIMAPServer(t, fakeIMAPServerConfig{
 		email:    "user@example.com",
 		password: "correct-password",
@@ -107,30 +113,32 @@ func TestIMAPClientLoginFallsBackAfterDNSLookupFailure(t *testing.T) {
 		t.Fatalf("SplitHostPort(server.Address()) error = %v", err)
 	}
 
-	client := &IMAPClient{
-		Address:  net.JoinHostPort("imap.gmail.com", port),
-		Email:    "user@example.com",
-		Password: "correct-password",
-		TLSConfig: &tls.Config{
-			InsecureSkipVerify: true,
-			MinVersion:         tls.VersionTLS12,
-		},
-		DialTLSContext: func(ctx context.Context, address string, tlsConfig *tls.Config) (net.Conn, error) {
-			return nil, &net.DNSError{
-				Err:        "no such host",
-				Name:       "imap.gmail.com",
-				IsNotFound: true,
-			}
-		},
-		LookupIPAddrs: func(ctx context.Context, host string) ([]net.IPAddr, error) {
-			return []net.IPAddr{{IP: net.ParseIP("127.0.0.1")}}, nil
+	client := &Client{
+		config: Config{
+			Address:  net.JoinHostPort("imap.gmail.com", port),
+			Email:    "user@example.com",
+			Password: "correct-password",
+			TLSConfig: &tls.Config{
+				InsecureSkipVerify: true,
+				MinVersion:         tls.VersionTLS12,
+			},
+			DialTLSContext: func(ctx context.Context, address string, tlsConfig *tls.Config) (net.Conn, error) {
+				return nil, &net.DNSError{
+					Err:        "no such host",
+					Name:       "imap.gmail.com",
+					IsNotFound: true,
+				}
+			},
+			LookupIPAddrs: func(ctx context.Context, host string) ([]net.IPAddr, error) {
+				return []net.IPAddr{{IP: net.ParseIP("127.0.0.1")}}, nil
+			},
 		},
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	session, err := client.Login(ctx)
+	session, err := client.login(ctx)
 	if err != nil {
 		t.Fatalf("Login() error = %v", err)
 	}
@@ -327,7 +335,7 @@ func TestPrioritizeDeleteMailboxesLeavesAllMailInNormalOrderForNonGmail(t *testi
 	}
 }
 
-func TestIMAPSessionShouldMoveAllMailToTrash(t *testing.T) {
+func TestSessionShouldMoveAllMailToTrash(t *testing.T) {
 	testCases := []struct {
 		name        string
 		provider    string
@@ -374,14 +382,14 @@ func TestIMAPSessionShouldMoveAllMailToTrash(t *testing.T) {
 
 	for _, testCase := range testCases {
 		t.Run(testCase.name, func(t *testing.T) {
-			var session *IMAPSession
+			var testSession *session
 			if testCase.withSession {
-				session = &IMAPSession{
-					client: &IMAPClient{Provider: testCase.provider},
+				testSession = &session{
+					client: &Client{config: Config{Provider: testCase.provider}},
 				}
 			}
 
-			got := session.shouldMoveAllMailToTrash(testCase.mailbox)
+			got := testSession.shouldMoveAllMailToTrash(testCase.mailbox)
 			if got != testCase.wantMove {
 				t.Fatalf("shouldMoveAllMailToTrash(%q) = %v, want %v", testCase.mailbox, got, testCase.wantMove)
 			}
@@ -427,7 +435,7 @@ func TestIsUnsupportedMoveError(t *testing.T) {
 	}
 }
 
-func TestIMAPSessionDeleteInboxOlderThanDays(t *testing.T) {
+func TestSessionDeleteBefore(t *testing.T) {
 	now := time.Date(2026, time.April, 2, 15, 30, 0, 0, time.UTC)
 	server := newFakeIMAPServer(t, fakeIMAPServerConfig{
 		email:    "user@example.com",
@@ -497,25 +505,27 @@ func TestIMAPSessionDeleteInboxOlderThanDays(t *testing.T) {
 	})
 	t.Cleanup(server.Close)
 
-	client := &IMAPClient{
-		Address:   server.Address(),
-		Email:     "user@example.com",
-		Password:  "correct-password",
-		TLSConfig: server.ClientTLSConfig(),
+	client := &Client{
+		config: Config{
+			Address:   server.Address(),
+			Email:     "user@example.com",
+			Password:  "correct-password",
+			TLSConfig: server.ClientTLSConfig(),
+		},
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	session, err := client.Login(ctx)
+	session, err := client.login(ctx)
 	if err != nil {
 		t.Fatalf("Login() error = %v", err)
 	}
 	defer session.Logout()
 
-	deletedEmails, err := session.DeleteInboxOlderThanDays(now, 90, false)
+	deletedEmails, err := session.deleteBefore(deleteCutoff(now, 90))
 	if err != nil {
-		t.Fatalf("DeleteInboxOlderThanDays() error = %v", err)
+		t.Fatalf("deleteBefore() error = %v", err)
 	}
 
 	deletedSubjects := make([]string, 0, len(deletedEmails))
@@ -528,7 +538,7 @@ func TestIMAPSessionDeleteInboxOlderThanDays(t *testing.T) {
 		"Archived old message",
 	}
 	if !slices.Equal(deletedSubjects, wantDeletedSubjects) {
-		t.Fatalf("DeleteInboxOlderThanDays() subjects = %v, want %v", deletedSubjects, wantDeletedSubjects)
+		t.Fatalf("deleteBefore() subjects = %v, want %v", deletedSubjects, wantDeletedSubjects)
 	}
 
 	remainingEmails := readAllMailboxSummariesForTest(t, session)
@@ -546,7 +556,7 @@ func TestIMAPSessionDeleteInboxOlderThanDays(t *testing.T) {
 	}
 }
 
-func TestIMAPSessionDeleteInboxOlderThanDaysSkipsFlaggedEvenWhenRequested(t *testing.T) {
+func TestSessionDeleteBeforeSkipsFlaggedMessages(t *testing.T) {
 	now := time.Date(2026, time.April, 2, 15, 30, 0, 0, time.UTC)
 	server := newFakeIMAPServer(t, fakeIMAPServerConfig{
 		email:    "user@example.com",
@@ -571,28 +581,30 @@ func TestIMAPSessionDeleteInboxOlderThanDaysSkipsFlaggedEvenWhenRequested(t *tes
 	})
 	t.Cleanup(server.Close)
 
-	client := &IMAPClient{
-		Address:   server.Address(),
-		Email:     "user@example.com",
-		Password:  "correct-password",
-		TLSConfig: server.ClientTLSConfig(),
+	client := &Client{
+		config: Config{
+			Address:   server.Address(),
+			Email:     "user@example.com",
+			Password:  "correct-password",
+			TLSConfig: server.ClientTLSConfig(),
+		},
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	session, err := client.Login(ctx)
+	session, err := client.login(ctx)
 	if err != nil {
 		t.Fatalf("Login() error = %v", err)
 	}
 	defer session.Logout()
 
-	deletedEmails, err := session.DeleteInboxOlderThanDays(now, 90, true)
+	deletedEmails, err := session.deleteBefore(deleteCutoff(now, 90))
 	if err != nil {
-		t.Fatalf("DeleteInboxOlderThanDays() error = %v", err)
+		t.Fatalf("deleteBefore() error = %v", err)
 	}
 	if len(deletedEmails) != 0 {
-		t.Fatalf("DeleteInboxOlderThanDays() deleted = %v, want no flagged emails deleted", deletedEmails)
+		t.Fatalf("deleteBefore() deleted = %v, want no flagged emails deleted", deletedEmails)
 	}
 
 	remainingEmails := readAllMailboxSummariesForTest(t, session)
@@ -604,7 +616,7 @@ func TestIMAPSessionDeleteInboxOlderThanDaysSkipsFlaggedEvenWhenRequested(t *tes
 	}
 }
 
-func TestIMAPSessionDeleteInboxOlderThanDaysSkipsFlaggedIfSearchReturnsIt(t *testing.T) {
+func TestSessionDeleteBeforeSkipsFlaggedSearchMatches(t *testing.T) {
 	now := time.Date(2026, time.April, 2, 15, 30, 0, 0, time.UTC)
 	server := newFakeIMAPServer(t, fakeIMAPServerConfig{
 		email:    "user@example.com",
@@ -641,29 +653,31 @@ func TestIMAPSessionDeleteInboxOlderThanDaysSkipsFlaggedIfSearchReturnsIt(t *tes
 	})
 	t.Cleanup(server.Close)
 
-	client := &IMAPClient{
-		Provider:  "gmail",
-		Address:   server.Address(),
-		Email:     "user@example.com",
-		Password:  "correct-password",
-		TLSConfig: server.ClientTLSConfig(),
+	client := &Client{
+		config: Config{
+			Provider:  "gmail",
+			Address:   server.Address(),
+			Email:     "user@example.com",
+			Password:  "correct-password",
+			TLSConfig: server.ClientTLSConfig(),
+		},
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	session, err := client.Login(ctx)
+	session, err := client.login(ctx)
 	if err != nil {
 		t.Fatalf("Login() error = %v", err)
 	}
 	defer session.Logout()
 
-	deletedEmails, err := session.DeleteInboxOlderThanDays(now, 90, false)
+	deletedEmails, err := session.deleteBefore(deleteCutoff(now, 90))
 	if err != nil {
-		t.Fatalf("DeleteInboxOlderThanDays() error = %v", err)
+		t.Fatalf("deleteBefore() error = %v", err)
 	}
 	if len(deletedEmails) != 1 {
-		t.Fatalf("DeleteInboxOlderThanDays() deleted = %v, want only non-flagged email deleted", deletedEmails)
+		t.Fatalf("deleteBefore() deleted = %v, want only non-flagged email deleted", deletedEmails)
 	}
 	if deletedEmails[0].Subject != "Regular old message" {
 		t.Fatalf("deleted subject = %q, want regular old message", deletedEmails[0].Subject)
@@ -678,7 +692,7 @@ func TestIMAPSessionDeleteInboxOlderThanDaysSkipsFlaggedIfSearchReturnsIt(t *tes
 	}
 }
 
-func TestIMAPSessionDeleteInboxOlderThanDaysGmailAllMailUsesPerEmailDelete(t *testing.T) {
+func TestSessionDeleteBeforeGmailAllMailUsesPerEmailDelete(t *testing.T) {
 	now := time.Date(2026, time.April, 2, 15, 30, 0, 0, time.UTC)
 	server := newFakeIMAPServer(t, fakeIMAPServerConfig{
 		email:    "user@example.com",
@@ -718,26 +732,28 @@ func TestIMAPSessionDeleteInboxOlderThanDaysGmailAllMailUsesPerEmailDelete(t *te
 	})
 	t.Cleanup(server.Close)
 
-	client := &IMAPClient{
-		Provider:  "gmail",
-		Address:   server.Address(),
-		Email:     "user@example.com",
-		Password:  "correct-password",
-		TLSConfig: server.ClientTLSConfig(),
+	client := &Client{
+		config: Config{
+			Provider:  "gmail",
+			Address:   server.Address(),
+			Email:     "user@example.com",
+			Password:  "correct-password",
+			TLSConfig: server.ClientTLSConfig(),
+		},
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	session, err := client.Login(ctx)
+	session, err := client.login(ctx)
 	if err != nil {
 		t.Fatalf("Login() error = %v", err)
 	}
 	defer session.Logout()
 
-	deletedEmails, err := session.DeleteInboxOlderThanDays(now, 90, false)
+	deletedEmails, err := session.deleteBefore(deleteCutoff(now, 90))
 	if err != nil {
-		t.Fatalf("DeleteInboxOlderThanDays() error = %v", err)
+		t.Fatalf("deleteBefore() error = %v", err)
 	}
 
 	deletedSubjects := make([]string, 0, len(deletedEmails))
@@ -749,11 +765,11 @@ func TestIMAPSessionDeleteInboxOlderThanDaysGmailAllMailUsesPerEmailDelete(t *te
 		"All Mail old message",
 	}
 	if !slices.Equal(deletedSubjects, wantDeletedSubjects) {
-		t.Fatalf("DeleteInboxOlderThanDays() subjects = %v, want %v", deletedSubjects, wantDeletedSubjects)
+		t.Fatalf("deleteBefore() subjects = %v, want %v", deletedSubjects, wantDeletedSubjects)
 	}
 }
 
-func TestIMAPSessionDeleteInboxOlderThanDaysDeletesEachMessageIndividually(t *testing.T) {
+func TestSessionDeleteBeforeDeletesEachMessageIndividually(t *testing.T) {
 	now := time.Date(2026, time.April, 2, 15, 30, 0, 0, time.UTC)
 	server := newFakeIMAPServer(t, fakeIMAPServerConfig{
 		email:    "user@example.com",
@@ -793,28 +809,30 @@ func TestIMAPSessionDeleteInboxOlderThanDaysDeletesEachMessageIndividually(t *te
 	})
 	t.Cleanup(server.Close)
 
-	client := &IMAPClient{
-		Address:   server.Address(),
-		Email:     "user@example.com",
-		Password:  "correct-password",
-		TLSConfig: server.ClientTLSConfig(),
+	client := &Client{
+		config: Config{
+			Address:   server.Address(),
+			Email:     "user@example.com",
+			Password:  "correct-password",
+			TLSConfig: server.ClientTLSConfig(),
+		},
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	session, err := client.Login(ctx)
+	session, err := client.login(ctx)
 	if err != nil {
 		t.Fatalf("Login() error = %v", err)
 	}
 	defer session.Logout()
 
-	deletedEmails, err := session.DeleteInboxOlderThanDays(now, 90, false)
+	deletedEmails, err := session.deleteBefore(deleteCutoff(now, 90))
 	if err != nil {
-		t.Fatalf("DeleteInboxOlderThanDays() error = %v", err)
+		t.Fatalf("deleteBefore() error = %v", err)
 	}
 	if len(deletedEmails) != 3 {
-		t.Fatalf("DeleteInboxOlderThanDays() deleted = %v, want 3 emails", deletedEmails)
+		t.Fatalf("deleteBefore() deleted = %v, want 3 emails", deletedEmails)
 	}
 	deletedSubjects := make([]string, 0, len(deletedEmails))
 	for _, email := range deletedEmails {
@@ -822,7 +840,7 @@ func TestIMAPSessionDeleteInboxOlderThanDaysDeletesEachMessageIndividually(t *te
 	}
 	wantDeletedSubjects := []string{"Old one", "Old two", "Old three"}
 	if !slices.Equal(deletedSubjects, wantDeletedSubjects) {
-		t.Fatalf("DeleteInboxOlderThanDays() subjects = %v, want %v", deletedSubjects, wantDeletedSubjects)
+		t.Fatalf("deleteBefore() subjects = %v, want %v", deletedSubjects, wantDeletedSubjects)
 	}
 
 	remainingEmails := readAllMailboxSummariesForTest(t, session)
@@ -831,7 +849,7 @@ func TestIMAPSessionDeleteInboxOlderThanDaysDeletesEachMessageIndividually(t *te
 	}
 }
 
-func TestIMAPSessionDeleteInboxOlderThanDaysSkipsStoreFailures(t *testing.T) {
+func TestSessionDeleteBeforeSkipsStoreFailures(t *testing.T) {
 	now := time.Date(2026, time.April, 2, 15, 30, 0, 0, time.UTC)
 	server := newFakeIMAPServer(t, fakeIMAPServerConfig{
 		email:    "user@example.com",
@@ -864,28 +882,30 @@ func TestIMAPSessionDeleteInboxOlderThanDaysSkipsStoreFailures(t *testing.T) {
 	})
 	t.Cleanup(server.Close)
 
-	client := &IMAPClient{
-		Address:   server.Address(),
-		Email:     "user@example.com",
-		Password:  "correct-password",
-		TLSConfig: server.ClientTLSConfig(),
+	client := &Client{
+		config: Config{
+			Address:   server.Address(),
+			Email:     "user@example.com",
+			Password:  "correct-password",
+			TLSConfig: server.ClientTLSConfig(),
+		},
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	session, err := client.Login(ctx)
+	session, err := client.login(ctx)
 	if err != nil {
 		t.Fatalf("Login() error = %v", err)
 	}
 	defer session.Logout()
 
-	deletedEmails, err := session.DeleteInboxOlderThanDays(now, 90, false)
+	deletedEmails, err := session.deleteBefore(deleteCutoff(now, 90))
 	if err == nil || !strings.Contains(err.Error(), "delete incomplete") {
-		t.Fatalf("DeleteInboxOlderThanDays() error = %v, want delete incomplete", err)
+		t.Fatalf("deleteBefore() error = %v, want delete incomplete", err)
 	}
 	if len(deletedEmails) != 0 {
-		t.Fatalf("DeleteInboxOlderThanDays() deleted = %v, want no emails deleted on store failures", deletedEmails)
+		t.Fatalf("deleteBefore() deleted = %v, want no emails deleted on store failures", deletedEmails)
 	}
 
 	remainingEmails := readAllMailboxSummariesForTest(t, session)
@@ -894,7 +914,7 @@ func TestIMAPSessionDeleteInboxOlderThanDaysSkipsStoreFailures(t *testing.T) {
 	}
 }
 
-func TestIMAPSessionDeleteInboxOlderThanDaysRecoversAfterAllMailStoreTimeout(t *testing.T) {
+func TestSessionDeleteBeforeRecoversAfterAllMailStoreTimeout(t *testing.T) {
 	now := time.Date(2026, time.April, 2, 15, 30, 0, 0, time.UTC)
 	server := newFakeIMAPServer(t, fakeIMAPServerConfig{
 		email:    "user@example.com",
@@ -931,30 +951,32 @@ func TestIMAPSessionDeleteInboxOlderThanDaysRecoversAfterAllMailStoreTimeout(t *
 	})
 	t.Cleanup(server.Close)
 
-	client := &IMAPClient{
-		Provider:  "gmail",
-		Address:   server.Address(),
-		Email:     "user@example.com",
-		Password:  "correct-password",
-		TLSConfig: server.ClientTLSConfig(),
+	client := &Client{
+		config: Config{
+			Provider:  "gmail",
+			Address:   server.Address(),
+			Email:     "user@example.com",
+			Password:  "correct-password",
+			TLSConfig: server.ClientTLSConfig(),
+		},
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	session, err := client.Login(ctx)
+	session, err := client.login(ctx)
 	if err != nil {
 		t.Fatalf("Login() error = %v", err)
 	}
 	defer session.Logout()
 	session.commandTimeout = 50 * time.Millisecond
 
-	deletedEmails, err := session.DeleteInboxOlderThanDays(now, 90, false)
+	deletedEmails, err := session.deleteBefore(deleteCutoff(now, 90))
 	if err != nil {
-		t.Fatalf("DeleteInboxOlderThanDays() error = %v", err)
+		t.Fatalf("deleteBefore() error = %v", err)
 	}
 	if len(deletedEmails) != 2 {
-		t.Fatalf("DeleteInboxOlderThanDays() deleted = %v, want both all mail emails deleted", deletedEmails)
+		t.Fatalf("deleteBefore() deleted = %v, want both all mail emails deleted", deletedEmails)
 	}
 
 	remainingEmails := readAllMailboxSummariesForTest(t, session)
@@ -963,7 +985,7 @@ func TestIMAPSessionDeleteInboxOlderThanDaysRecoversAfterAllMailStoreTimeout(t *
 	}
 }
 
-func TestIMAPSessionDeleteInboxOlderThanDaysRescansMovedTrashCopies(t *testing.T) {
+func TestSessionDeleteBeforeRescansMovedTrashCopies(t *testing.T) {
 	now := time.Date(2026, time.April, 2, 15, 30, 0, 0, time.UTC)
 	server := newFakeIMAPServer(t, fakeIMAPServerConfig{
 		email:    "user@example.com",
@@ -992,31 +1014,33 @@ func TestIMAPSessionDeleteInboxOlderThanDaysRescansMovedTrashCopies(t *testing.T
 	})
 	t.Cleanup(server.Close)
 
-	client := &IMAPClient{
-		Address:   server.Address(),
-		Email:     "user@example.com",
-		Password:  "correct-password",
-		TLSConfig: server.ClientTLSConfig(),
+	client := &Client{
+		config: Config{
+			Address:   server.Address(),
+			Email:     "user@example.com",
+			Password:  "correct-password",
+			TLSConfig: server.ClientTLSConfig(),
+		},
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	session, err := client.Login(ctx)
+	session, err := client.login(ctx)
 	if err != nil {
 		t.Fatalf("Login() error = %v", err)
 	}
 	defer session.Logout()
 
-	deletedEmails, err := session.DeleteInboxOlderThanDays(now, 1, false)
+	deletedEmails, err := session.deleteBefore(deleteCutoff(now, 1))
 	if err != nil {
-		t.Fatalf("DeleteInboxOlderThanDays() error = %v", err)
+		t.Fatalf("deleteBefore() error = %v", err)
 	}
 	if len(deletedEmails) != 1 {
-		t.Fatalf("DeleteInboxOlderThanDays() deleted = %v, want 1 logical email", deletedEmails)
+		t.Fatalf("deleteBefore() deleted = %v, want 1 logical email", deletedEmails)
 	}
 	if deletedEmails[0].Mailbox != "INBOX" {
-		t.Fatalf("DeleteInboxOlderThanDays() kept mailbox %q, want INBOX", deletedEmails[0].Mailbox)
+		t.Fatalf("deleteBefore() kept mailbox %q, want INBOX", deletedEmails[0].Mailbox)
 	}
 
 	remainingEmails := readAllMailboxSummariesForTest(t, session)
@@ -1025,7 +1049,7 @@ func TestIMAPSessionDeleteInboxOlderThanDaysRescansMovedTrashCopies(t *testing.T
 	}
 }
 
-func TestIMAPSessionDeleteInboxOlderThanDaysSkipsTimedOutMailboxDeletes(t *testing.T) {
+func TestSessionDeleteBeforeSkipsTimedOutMailboxDeletes(t *testing.T) {
 	now := time.Date(2026, time.April, 2, 15, 30, 0, 0, time.UTC)
 	server := newFakeIMAPServer(t, fakeIMAPServerConfig{
 		email:    "user@example.com",
@@ -1064,36 +1088,38 @@ func TestIMAPSessionDeleteInboxOlderThanDaysSkipsTimedOutMailboxDeletes(t *testi
 	})
 	t.Cleanup(server.Close)
 
-	client := &IMAPClient{
-		Address:   server.Address(),
-		Email:     "user@example.com",
-		Password:  "correct-password",
-		TLSConfig: server.ClientTLSConfig(),
+	client := &Client{
+		config: Config{
+			Address:   server.Address(),
+			Email:     "user@example.com",
+			Password:  "correct-password",
+			TLSConfig: server.ClientTLSConfig(),
+		},
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
 
-	session, err := client.Login(ctx)
+	session, err := client.login(ctx)
 	if err != nil {
 		t.Fatalf("Login() error = %v", err)
 	}
 	defer session.Logout()
 
-	deletedEmails, err := session.DeleteInboxOlderThanDays(now, 90, false)
+	deletedEmails, err := session.deleteBefore(deleteCutoff(now, 90))
 	if err == nil || !strings.Contains(err.Error(), "delete incomplete") {
-		t.Fatalf("DeleteInboxOlderThanDays() error = %v, want delete incomplete", err)
+		t.Fatalf("deleteBefore() error = %v, want delete incomplete", err)
 	}
 
 	if len(deletedEmails) != 2 {
-		t.Fatalf("DeleteInboxOlderThanDays() deleted = %v, want 2 deleted emails", deletedEmails)
+		t.Fatalf("deleteBefore() deleted = %v, want 2 deleted emails", deletedEmails)
 	}
 	if deletedEmails[0].Subject != "Old inbox message" {
-		t.Fatalf("DeleteInboxOlderThanDays() subject = %q, want inbox email", deletedEmails[0].Subject)
+		t.Fatalf("deleteBefore() subject = %q, want inbox email", deletedEmails[0].Subject)
 	}
 }
 
-func TestIMAPSessionDeleteInboxOlderThanDaysReturnsPartialResultsAfterSearchTimeout(t *testing.T) {
+func TestSessionDeleteBeforeReturnsPartialResultsAfterSearchTimeout(t *testing.T) {
 	now := time.Date(2026, time.April, 2, 15, 30, 0, 0, time.UTC)
 	server := newFakeIMAPServer(t, fakeIMAPServerConfig{
 		email:    "user@example.com",
@@ -1132,35 +1158,41 @@ func TestIMAPSessionDeleteInboxOlderThanDaysReturnsPartialResultsAfterSearchTime
 	})
 	t.Cleanup(server.Close)
 
-	client := &IMAPClient{
-		Address:   server.Address(),
-		Email:     "user@example.com",
-		Password:  "correct-password",
-		TLSConfig: server.ClientTLSConfig(),
+	client := &Client{
+		config: Config{
+			Address:   server.Address(),
+			Email:     "user@example.com",
+			Password:  "correct-password",
+			TLSConfig: server.ClientTLSConfig(),
+		},
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
 
-	session, err := client.Login(ctx)
+	session, err := client.login(ctx)
 	if err != nil {
 		t.Fatalf("Login() error = %v", err)
 	}
 	defer session.Logout()
 
-	deletedEmails, err := session.DeleteInboxOlderThanDays(now, 90, false)
+	deletedEmails, err := session.deleteBefore(deleteCutoff(now, 90))
 	if err == nil || !strings.Contains(err.Error(), "delete incomplete") {
-		t.Fatalf("DeleteInboxOlderThanDays() error = %v, want delete incomplete", err)
+		t.Fatalf("deleteBefore() error = %v, want delete incomplete", err)
 	}
 	if len(deletedEmails) != 1 {
-		t.Fatalf("DeleteInboxOlderThanDays() deleted = %v, want 1 partial delete", deletedEmails)
+		t.Fatalf("deleteBefore() deleted = %v, want 1 partial delete", deletedEmails)
 	}
 	if deletedEmails[0].Subject != "Old inbox message" {
-		t.Fatalf("DeleteInboxOlderThanDays() subject = %q, want inbox email", deletedEmails[0].Subject)
+		t.Fatalf("deleteBefore() subject = %q, want inbox email", deletedEmails[0].Subject)
 	}
 }
 
-func readAllMailboxSummariesForTest(t *testing.T, session *IMAPSession) []EmailSummary {
+func deleteCutoff(now time.Time, age int) time.Time {
+	return startOfDay(now.AddDate(0, 0, -age)).AddDate(0, 0, 1)
+}
+
+func readAllMailboxSummariesForTest(t *testing.T, session *session) []MessageSummary {
 	t.Helper()
 
 	mailboxes, err := session.listMailboxes()
@@ -1168,7 +1200,7 @@ func readAllMailboxSummariesForTest(t *testing.T, session *IMAPSession) []EmailS
 		t.Fatalf("listMailboxes() error = %v", err)
 	}
 
-	summaries := make([]EmailSummary, 0)
+	summaries := make([]MessageSummary, 0)
 	for _, mailbox := range mailboxes {
 		if err := session.selectMailboxWithRetry(mailbox); err != nil {
 			t.Fatalf("selectMailboxWithRetry(%q) error = %v", mailbox, err)
@@ -1179,14 +1211,14 @@ func readAllMailboxSummariesForTest(t *testing.T, session *IMAPSession) []EmailS
 			t.Fatalf("searchUIDsWithRetryConfig(%q) error = %v", mailbox, err)
 		}
 
-		mailboxSummaries, err := session.fetchEmailSummariesByUID(mailbox, uids)
+		mailboxSummaries, err := session.fetchMessageSummariesByUID(mailbox, uids)
 		if err != nil {
-			t.Fatalf("fetchEmailSummariesByUID(%q) error = %v", mailbox, err)
+			t.Fatalf("fetchMessageSummariesByUID(%q) error = %v", mailbox, err)
 		}
 		summaries = append(summaries, mailboxSummaries...)
 	}
 
-	return dedupeEmailSummaries(summaries)
+	return dedupeMessageSummaries(summaries)
 }
 
 type fakeIMAPServer struct {

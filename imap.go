@@ -41,16 +41,14 @@ const (
 	deleteRetryBackoff       = time.Second
 )
 
-type ADDR string
-
 const (
-	AOL        ADDR = imapAddressAOL
-	AOL_EXPORT ADDR = imapAddressAOLExport
-	GMAIL      ADDR = imapAddressGmail
-	ICLOUD     ADDR = imapAddressICloud
-	OUTLOOK    ADDR = imapAddressOutlook
-	YAHOO      ADDR = imapAddressYahoo
-	ZOHO       ADDR = imapAddressZoho
+	AOL        = imapAddressAOL
+	AOL_EXPORT = imapAddressAOLExport
+	GMAIL      = imapAddressGmail
+	ICLOUD     = imapAddressICloud
+	OUTLOOK    = imapAddressOutlook
+	YAHOO      = imapAddressYahoo
+	ZOHO       = imapAddressZoho
 )
 
 var providerIMAPAddresses = map[string]string{
@@ -69,7 +67,7 @@ var providerIMAPAddresses = map[string]string{
 	"zoho":         imapAddressZoho,
 }
 
-type IMAPClient struct {
+type Config struct {
 	Provider       string
 	Address        string
 	Email          string
@@ -79,18 +77,21 @@ type IMAPClient struct {
 	LookupIPAddrs  func(context.Context, string) ([]net.IPAddr, error)
 }
 
-type IMAPSession struct {
+type Client struct {
+	config Config
+}
+
+type session struct {
 	conn           net.Conn
 	reader         *bufio.Reader
 	writer         *bufio.Writer
 	nextTag        int
 	commandTimeout time.Duration
 	timedOut       bool
-	client         *IMAPClient
+	client         *Client
 }
 
-type EmailSummary struct {
-	Account        string
+type MessageSummary struct {
 	Mailbox        string
 	MessageID      string
 	SequenceNumber int
@@ -129,24 +130,24 @@ func ResolveIMAPAddress(provider string, address string) (string, error) {
 	return resolvedAddress, nil
 }
 
-func (c *IMAPClient) Login(ctx context.Context) (*IMAPSession, error) {
+func (c *Client) login(ctx context.Context) (*session, error) {
 	if err := c.validate(); err != nil {
 		return nil, err
 	}
 
-	email, err := quoteIMAPString(c.Email)
+	email, err := quoteIMAPString(c.config.Email)
 	if err != nil {
 		return nil, fmt.Errorf("invalid email: %w", err)
 	}
 
-	password, err := quoteIMAPString(c.Password)
+	password, err := quoteIMAPString(c.config.Password)
 	if err != nil {
 		return nil, fmt.Errorf("invalid password: %w", err)
 	}
 
-	host, port, err := net.SplitHostPort(c.Address)
+	host, port, err := net.SplitHostPort(c.config.Address)
 	if err != nil {
-		return nil, fmt.Errorf("invalid IMAP address %q: %w", c.Address, err)
+		return nil, fmt.Errorf("invalid IMAP address %q: %w", c.config.Address, err)
 	}
 
 	tlsConfig := c.cloneTLSConfig(host)
@@ -155,7 +156,7 @@ func (c *IMAPClient) Login(ctx context.Context) (*IMAPSession, error) {
 		return nil, fmt.Errorf("connect to IMAP server: %w", err)
 	}
 
-	session := &IMAPSession{
+	session := &session{
 		conn:    conn,
 		reader:  bufio.NewReader(conn),
 		writer:  bufio.NewWriter(conn),
@@ -180,30 +181,30 @@ func (c *IMAPClient) Login(ctx context.Context) (*IMAPSession, error) {
 	return session, nil
 }
 
-func (c *IMAPClient) validate() error {
+func (c *Client) validate() error {
 	switch {
 	case c == nil:
-		return fmt.Errorf("imap client is required")
-	case c.Address == "":
+		return fmt.Errorf("client is required")
+	case c.config.Address == "":
 		return fmt.Errorf("imap address is required")
-	case c.Email == "":
+	case c.config.Email == "":
 		return fmt.Errorf("email is required")
-	case c.Password == "":
+	case c.config.Password == "":
 		return fmt.Errorf("password is required")
 	default:
 		return nil
 	}
 }
 
-func (c *IMAPClient) cloneTLSConfig(serverName string) *tls.Config {
-	if c.TLSConfig == nil {
+func (c *Client) cloneTLSConfig(serverName string) *tls.Config {
+	if c.config.TLSConfig == nil {
 		return &tls.Config{
 			MinVersion: tls.VersionTLS12,
 			ServerName: serverName,
 		}
 	}
 
-	config := c.TLSConfig.Clone()
+	config := c.config.TLSConfig.Clone()
 	if config.MinVersion == 0 {
 		config.MinVersion = tls.VersionTLS12
 	}
@@ -214,7 +215,7 @@ func (c *IMAPClient) cloneTLSConfig(serverName string) *tls.Config {
 	return config
 }
 
-func (c *IMAPClient) connect(ctx context.Context, host, port string, tlsConfig *tls.Config) (net.Conn, error) {
+func (c *Client) connect(ctx context.Context, host, port string, tlsConfig *tls.Config) (net.Conn, error) {
 	address := net.JoinHostPort(host, port)
 
 	conn, err := c.dialTLS(ctx, address, tlsConfig)
@@ -233,16 +234,16 @@ func (c *IMAPClient) connect(ctx context.Context, host, port string, tlsConfig *
 	return nil, fmt.Errorf("%w; lookup fallback failed: %v", err, fallbackErr)
 }
 
-func (c *IMAPClient) dialTLS(ctx context.Context, address string, tlsConfig *tls.Config) (net.Conn, error) {
-	if c != nil && c.DialTLSContext != nil {
-		return c.DialTLSContext(ctx, address, tlsConfig)
+func (c *Client) dialTLS(ctx context.Context, address string, tlsConfig *tls.Config) (net.Conn, error) {
+	if c != nil && c.config.DialTLSContext != nil {
+		return c.config.DialTLSContext(ctx, address, tlsConfig)
 	}
 
 	dialer := &tls.Dialer{Config: tlsConfig}
 	return dialer.DialContext(ctx, "tcp", address)
 }
 
-func (c *IMAPClient) resolveAndDialTLS(ctx context.Context, host, port string, tlsConfig *tls.Config) (net.Conn, error) {
+func (c *Client) resolveAndDialTLS(ctx context.Context, host, port string, tlsConfig *tls.Config) (net.Conn, error) {
 	ipAddrs, err := c.lookupIPAddrs(ctx, host)
 	if err != nil {
 		return nil, fmt.Errorf("resolve host %s: %w", host, err)
@@ -267,16 +268,16 @@ func (c *IMAPClient) resolveAndDialTLS(ctx context.Context, host, port string, t
 	return nil, fmt.Errorf("resolve host %s: no IP addresses returned", host)
 }
 
-func (c *IMAPClient) lookupIPAddrs(ctx context.Context, host string) ([]net.IPAddr, error) {
-	if c != nil && c.LookupIPAddrs != nil {
-		return c.LookupIPAddrs(ctx, host)
+func (c *Client) lookupIPAddrs(ctx context.Context, host string) ([]net.IPAddr, error) {
+	if c != nil && c.config.LookupIPAddrs != nil {
+		return c.config.LookupIPAddrs(ctx, host)
 	}
 
 	resolver := &net.Resolver{PreferGo: true}
 	return resolver.LookupIPAddr(ctx, host)
 }
 
-func (c *IMAPClient) dialTLSByIP(ctx context.Context, ip, port, serverName string, tlsConfig *tls.Config) (net.Conn, error) {
+func (c *Client) dialTLSByIP(ctx context.Context, ip, port, serverName string, tlsConfig *tls.Config) (net.Conn, error) {
 	dialer := &net.Dialer{}
 	rawConn, err := dialer.DialContext(ctx, "tcp", net.JoinHostPort(ip, port))
 	if err != nil {
@@ -297,7 +298,7 @@ func (c *IMAPClient) dialTLSByIP(ctx context.Context, ip, port, serverName strin
 	return tlsConn, nil
 }
 
-func (s *IMAPSession) Logout() error {
+func (s *session) Logout() error {
 	if s == nil || s.conn == nil {
 		return nil
 	}
@@ -313,20 +314,16 @@ func (s *IMAPSession) Logout() error {
 	return closeErr
 }
 
-func (s *IMAPSession) DeleteInboxOlderThanDays(now time.Time, days int, includeFlagged bool) ([]EmailSummary, error) {
-	if days < 0 {
-		return nil, fmt.Errorf("age must be 0 or greater")
+func (s *session) deleteBefore(before time.Time) ([]MessageSummary, error) {
+	if before.IsZero() {
+		return nil, fmt.Errorf("received before is required")
 	}
 
-	cutoff := startOfDay(now.AddDate(0, 0, -days)).AddDate(0, 0, 1)
-	if includeFlagged {
-		log.Printf("include-flagged is enabled but ignored; flagged/starred emails are always skipped")
-	}
-
-	return s.deleteInboxByCriteria("BEFORE %s UNFLAGGED", formatIMAPDate(cutoff))
+	return s.deleteMatchingMessages("BEFORE %s UNFLAGGED", formatIMAPDate(before))
 }
-func (s *IMAPSession) deleteInboxByCriteria(format string, args ...any) ([]EmailSummary, error) {
-	var deletedSummaries []EmailSummary
+
+func (s *session) deleteMatchingMessages(format string, args ...any) ([]MessageSummary, error) {
+	var deletedSummaries []MessageSummary
 	var firstErr error
 
 deletePasses:
@@ -417,7 +414,7 @@ deletePasses:
 		return nil, firstErr
 	}
 
-	deletedSummaries = dedupeEmailSummaries(deletedSummaries)
+	deletedSummaries = dedupeMessageSummaries(deletedSummaries)
 	remainingCount, err := s.checkDeleteCompletion(format, args...)
 	if err != nil {
 		log.Printf("delete incomplete: unable to verify all mailboxes: %v", err)
@@ -430,7 +427,7 @@ deletePasses:
 	return deletedSummaries, nil
 }
 
-func (s *IMAPSession) checkDeleteCompletion(format string, args ...any) (int, error) {
+func (s *session) checkDeleteCompletion(format string, args ...any) (int, error) {
 	mailboxes, err := s.listMailboxes()
 	if err != nil {
 		return 0, fmt.Errorf("list mailboxes for delete verification: %w", err)
@@ -462,7 +459,7 @@ func (s *IMAPSession) checkDeleteCompletion(format string, args ...any) (int, er
 			continue
 		}
 
-		summaries, err := s.fetchEmailSummariesByUID(mailbox, uids)
+		summaries, err := s.fetchMessageSummariesByUID(mailbox, uids)
 		if err != nil {
 			if isRetryableConnectionError(err) {
 				return remainingCount, fmt.Errorf("fetch mailbox %s for delete verification: %w", mailbox, err)
@@ -504,9 +501,9 @@ func (s *IMAPSession) checkDeleteCompletion(format string, args ...any) (int, er
 	return 0, nil
 }
 
-func (s *IMAPSession) deleteMailboxWithRetry(mailbox string, format string, args ...any) ([]EmailSummary, int, bool, error) {
+func (s *session) deleteMailboxWithRetry(mailbox string, format string, args ...any) ([]MessageSummary, int, bool, error) {
 	var lastTimeoutErr error
-	deletedSummaries := make([]EmailSummary, 0)
+	deletedSummaries := make([]MessageSummary, 0)
 	movedToTrashCount := 0
 	hadSearchResults := false
 
@@ -535,7 +532,7 @@ attemptLoop:
 			batchSize = defaultDeleteBatchSize
 		}
 
-		attemptDeletedSummaries := make([]EmailSummary, 0, len(uids))
+		attemptDeletedSummaries := make([]MessageSummary, 0, len(uids))
 		attemptMovedToTrashCount := 0
 		totalBatches := (len(uids) + batchSize - 1) / batchSize
 		for start := 0; start < len(uids); start += batchSize {
@@ -552,7 +549,7 @@ attemptLoop:
 				end-start,
 			)
 
-			summaries, err := s.fetchEmailSummariesByUID(mailbox, uids[start:end])
+			summaries, err := s.fetchMessageSummariesByUID(mailbox, uids[start:end])
 			if err != nil {
 				if !isRetryableConnectionError(err) {
 					return deletedSummaries, movedToTrashCount, true, err
@@ -605,12 +602,12 @@ attemptLoop:
 	return nil, 0, hadSearchResults, nil
 }
 
-func (s *IMAPSession) deleteSelectedMailboxMessages(summaries []EmailSummary) ([]EmailSummary, int) {
+func (s *session) deleteSelectedMailboxMessages(summaries []MessageSummary) ([]MessageSummary, int) {
 	if len(summaries) == 0 {
 		return nil, 0
 	}
 
-	orderedSummaries := append([]EmailSummary(nil), summaries...)
+	orderedSummaries := append([]MessageSummary(nil), summaries...)
 
 	mailbox := orderedSummaries[0].Mailbox
 	moveToTrashFirst := s.shouldMoveAllMailToTrash(mailbox)
@@ -619,8 +616,8 @@ func (s *IMAPSession) deleteSelectedMailboxMessages(summaries []EmailSummary) ([
 		batchSize = defaultDeleteBatchSize
 	}
 
-	deletedSummaries := make([]EmailSummary, 0, len(orderedSummaries))
-	pendingExpunge := make([]EmailSummary, 0, batchSize)
+	deletedSummaries := make([]MessageSummary, 0, len(orderedSummaries))
+	pendingExpunge := make([]MessageSummary, 0, batchSize)
 	movedToTrashCount := 0
 	totalBatches := (len(orderedSummaries) + batchSize - 1) / batchSize
 
@@ -759,7 +756,7 @@ func (s *IMAPSession) deleteSelectedMailboxMessages(summaries []EmailSummary) ([
 	return deletedSummaries, movedToTrashCount
 }
 
-func (s *IMAPSession) storeDeletedFlagByUIDWithRetry(summary EmailSummary) error {
+func (s *session) storeDeletedFlagByUIDWithRetry(summary MessageSummary) error {
 	var lastErr error
 	for attempt := 0; attempt < maxDeleteStoreRetries; attempt++ {
 		err := s.storeDeletedFlagByUID(summary.UID)
@@ -795,7 +792,7 @@ func (s *IMAPSession) storeDeletedFlagByUIDWithRetry(summary EmailSummary) error
 	return fmt.Errorf("uid store failed")
 }
 
-func (s *IMAPSession) storeDeletedFlagByUID(uid uint32) error {
+func (s *session) storeDeletedFlagByUID(uid uint32) error {
 	if uid == 0 {
 		return fmt.Errorf("uid is required")
 	}
@@ -804,7 +801,7 @@ func (s *IMAPSession) storeDeletedFlagByUID(uid uint32) error {
 	return err
 }
 
-func (s *IMAPSession) moveMessageToTrashByUID(uid uint32, trashMailbox string) error {
+func (s *session) moveMessageToTrashByUID(uid uint32, trashMailbox string) error {
 	if uid == 0 {
 		return fmt.Errorf("uid is required")
 	}
@@ -818,7 +815,7 @@ func (s *IMAPSession) moveMessageToTrashByUID(uid uint32, trashMailbox string) e
 	return err
 }
 
-func (s *IMAPSession) moveMessageToTrashByUIDWithRetry(summary EmailSummary, trashMailbox string) (bool, error) {
+func (s *session) moveMessageToTrashByUIDWithRetry(summary MessageSummary, trashMailbox string) (bool, error) {
 	var lastErr error
 	for attempt := 0; attempt < maxDeleteStoreRetries; attempt++ {
 		err := s.moveMessageToTrashByUID(summary.UID, trashMailbox)
@@ -862,7 +859,7 @@ func (s *IMAPSession) moveMessageToTrashByUIDWithRetry(summary EmailSummary, tra
 	return false, fmt.Errorf("uid move failed")
 }
 
-func (s *IMAPSession) reconnectAndSelectMailbox(mailbox string) error {
+func (s *session) reconnectAndSelectMailbox(mailbox string) error {
 	if err := s.reconnect(); err != nil {
 		return err
 	}
@@ -873,7 +870,7 @@ func (s *IMAPSession) reconnectAndSelectMailbox(mailbox string) error {
 	return nil
 }
 
-func (s *IMAPSession) expungeMailboxWithRetry(mailbox string) error {
+func (s *session) expungeMailboxWithRetry(mailbox string) error {
 	var lastErr error
 	for attempt := 0; attempt < maxDeleteExpungeRetries; attempt++ {
 		_, _, err := s.runCommand("EXPUNGE")
@@ -908,7 +905,7 @@ func (s *IMAPSession) expungeMailboxWithRetry(mailbox string) error {
 	return fmt.Errorf("expunge failed")
 }
 
-func (s *IMAPSession) listMailboxes() ([]string, error) {
+func (s *session) listMailboxes() ([]string, error) {
 	var lines []imapResponseLine
 	var err error
 	for attempt := 0; attempt < maxMailboxCommandRetries; attempt++ {
@@ -968,7 +965,7 @@ func (s *IMAPSession) listMailboxes() ([]string, error) {
 	return mailboxes, nil
 }
 
-func (s *IMAPSession) selectMailbox(mailbox string) error {
+func (s *session) selectMailbox(mailbox string) error {
 	quotedMailbox, err := quoteIMAPString(mailbox)
 	if err != nil {
 		return err
@@ -982,15 +979,15 @@ func (s *IMAPSession) selectMailbox(mailbox string) error {
 	return nil
 }
 
-func (s *IMAPSession) selectMailboxWithRetry(mailbox string) error {
+func (s *session) selectMailboxWithRetry(mailbox string) error {
 	return s.selectMailboxWithRetryConfig(mailbox, maxMailboxCommandRetries, 0)
 }
 
-func (s *IMAPSession) deleteSelectMailboxWithRetry(mailbox string) error {
+func (s *session) deleteSelectMailboxWithRetry(mailbox string) error {
 	return s.selectMailboxWithRetryConfig(mailbox, maxDeleteCommandRetries, deleteRetryBackoff)
 }
 
-func (s *IMAPSession) selectMailboxWithRetryConfig(mailbox string, maxAttempts int, backoff time.Duration) error {
+func (s *session) selectMailboxWithRetryConfig(mailbox string, maxAttempts int, backoff time.Duration) error {
 	var lastErr error
 	for attempt := 0; attempt < maxAttempts; attempt++ {
 		if err := s.selectMailbox(mailbox); err == nil {
@@ -1024,7 +1021,7 @@ func (s *IMAPSession) selectMailboxWithRetryConfig(mailbox string, maxAttempts i
 	return fmt.Errorf("select mailbox %s failed", mailbox)
 }
 
-func (s *IMAPSession) searchUIDs(format string, args ...any) ([]uint32, error) {
+func (s *session) searchUIDs(format string, args ...any) ([]uint32, error) {
 	lines, _, err := s.runCommand("UID SEARCH "+format, args...)
 	if err != nil {
 		return nil, fmt.Errorf("search mailbox: %w", err)
@@ -1169,11 +1166,11 @@ func expandIDRange(segment string) []uint32 {
 	return ids
 }
 
-func (s *IMAPSession) deleteSearchUIDsWithRetry(mailbox string, format string, args ...any) ([]uint32, error) {
+func (s *session) deleteSearchUIDsWithRetry(mailbox string, format string, args ...any) ([]uint32, error) {
 	return s.searchUIDsWithRetryConfig(mailbox, maxDeleteCommandRetries, deleteRetryBackoff, format, args...)
 }
 
-func (s *IMAPSession) searchUIDsWithRetryConfig(mailbox string, maxAttempts int, backoff time.Duration, format string, args ...any) ([]uint32, error) {
+func (s *session) searchUIDsWithRetryConfig(mailbox string, maxAttempts int, backoff time.Duration, format string, args ...any) ([]uint32, error) {
 	var lastErr error
 	for attempt := 0; attempt < maxAttempts; attempt++ {
 		uids, err := s.searchUIDs(format, args...)
@@ -1216,31 +1213,31 @@ func sleepRetryBackoff(delay time.Duration) {
 	time.Sleep(delay)
 }
 
-func (s *IMAPSession) fetchEmailSummariesByUID(mailbox string, uids []uint32) ([]EmailSummary, error) {
+func (s *session) fetchMessageSummariesByUID(mailbox string, uids []uint32) ([]MessageSummary, error) {
 	if len(uids) == 0 {
 		return nil, nil
 	}
 
-	return s.fetchEmailSummariesInBatches(
+	return s.fetchMessageSummariesInBatches(
 		mailbox,
 		len(uids),
-		func(start, end int) ([]EmailSummary, error) {
-			return s.fetchEmailSummaryBatchByUID(mailbox, uids[start:end])
+		func(start, end int) ([]MessageSummary, error) {
+			return s.fetchMessageSummaryBatchByUID(mailbox, uids[start:end])
 		},
 	)
 }
 
-func (s *IMAPSession) fetchEmailSummariesInBatches(
+func (s *session) fetchMessageSummariesInBatches(
 	mailbox string,
 	total int,
-	fetchBatch func(start, end int) ([]EmailSummary, error),
-) ([]EmailSummary, error) {
+	fetchBatch func(start, end int) ([]MessageSummary, error),
+) ([]MessageSummary, error) {
 	batchSize := fetchBatchSize
 	if batchSize <= 0 {
 		batchSize = defaultFetchBatchSize
 	}
 
-	summaries := make([]EmailSummary, 0, total)
+	summaries := make([]MessageSummary, 0, total)
 	for start := 0; start < total; start += batchSize {
 		end := start + batchSize
 		if end > total {
@@ -1257,12 +1254,12 @@ func (s *IMAPSession) fetchEmailSummariesInBatches(
 	return summaries, nil
 }
 
-func (s *IMAPSession) fetchBatchWithRetry(
+func (s *session) fetchBatchWithRetry(
 	mailbox string,
 	start int,
 	end int,
-	fetchBatch func(start, end int) ([]EmailSummary, error),
-) ([]EmailSummary, error) {
+	fetchBatch func(start, end int) ([]MessageSummary, error),
+) ([]MessageSummary, error) {
 	var lastErr error
 	for attempt := 0; attempt < maxFetchRetryAttempts; attempt++ {
 		batchSummaries, err := fetchBatch(start, end)
@@ -1296,7 +1293,7 @@ func (s *IMAPSession) fetchBatchWithRetry(
 	return nil, fmt.Errorf("fetch batch failed")
 }
 
-func (s *IMAPSession) fetchEmailSummaryBatchByUID(mailbox string, uids []uint32) ([]EmailSummary, error) {
+func (s *session) fetchMessageSummaryBatchByUID(mailbox string, uids []uint32) ([]MessageSummary, error) {
 	values := make([]string, 0, len(uids))
 	for _, uid := range uids {
 		values = append(values, strconv.FormatUint(uint64(uid), 10))
@@ -1310,7 +1307,7 @@ func (s *IMAPSession) fetchEmailSummaryBatchByUID(mailbox string, uids []uint32)
 		return nil, err
 	}
 
-	summaries := make([]EmailSummary, 0, len(uids))
+	summaries := make([]MessageSummary, 0, len(uids))
 	for _, responseLine := range lines {
 		if !strings.HasPrefix(responseLine.line, "* ") || !strings.Contains(responseLine.line, " FETCH ") {
 			continue
@@ -1326,7 +1323,7 @@ func (s *IMAPSession) fetchEmailSummaryBatchByUID(mailbox string, uids []uint32)
 	return summaries, nil
 }
 
-func (s *IMAPSession) runCommand(format string, args ...any) ([]imapResponseLine, string, error) {
+func (s *session) runCommand(format string, args ...any) ([]imapResponseLine, string, error) {
 	if err := s.applyCommandDeadline(); err != nil {
 		return nil, "", err
 	}
@@ -1345,7 +1342,7 @@ func (s *IMAPSession) runCommand(format string, args ...any) ([]imapResponseLine
 	return s.readTaggedResponse(tag)
 }
 
-func (s *IMAPSession) expectGreeting() error {
+func (s *session) expectGreeting() error {
 	if err := s.applyCommandDeadline(); err != nil {
 		return err
 	}
@@ -1361,7 +1358,7 @@ func (s *IMAPSession) expectGreeting() error {
 	return nil
 }
 
-func (s *IMAPSession) applyCommandDeadline() error {
+func (s *session) applyCommandDeadline() error {
 	if s == nil || s.conn == nil {
 		return nil
 	}
@@ -1375,7 +1372,7 @@ func (s *IMAPSession) applyCommandDeadline() error {
 	return nil
 }
 
-func (s *IMAPSession) readTaggedResponse(tag string) ([]imapResponseLine, string, error) {
+func (s *session) readTaggedResponse(tag string) ([]imapResponseLine, string, error) {
 	var responseLines []imapResponseLine
 
 	for {
@@ -1414,7 +1411,7 @@ func (s *IMAPSession) readTaggedResponse(tag string) ([]imapResponseLine, string
 	}
 }
 
-func (s *IMAPSession) readLine() (string, error) {
+func (s *session) readLine() (string, error) {
 	line, err := s.reader.ReadString('\n')
 	if err != nil {
 		return "", err
@@ -1432,39 +1429,39 @@ func quoteIMAPString(value string) (string, error) {
 	return `"` + replacer.Replace(value) + `"`, nil
 }
 
-func parseFetchSummary(mailbox string, responseLine imapResponseLine) (EmailSummary, error) {
+func parseFetchSummary(mailbox string, responseLine imapResponseLine) (MessageSummary, error) {
 	fields := strings.Fields(responseLine.line)
 	if len(fields) < 3 {
-		return EmailSummary{}, fmt.Errorf("malformed FETCH response: %s", responseLine.line)
+		return MessageSummary{}, fmt.Errorf("malformed FETCH response: %s", responseLine.line)
 	}
 
 	sequenceNumber, err := strconv.Atoi(fields[1])
 	if err != nil {
-		return EmailSummary{}, fmt.Errorf("parse FETCH sequence number %q: %w", fields[1], err)
+		return MessageSummary{}, fmt.Errorf("parse FETCH sequence number %q: %w", fields[1], err)
 	}
 
 	uid, err := extractUint32Token(responseLine.line, "UID ")
 	if err != nil {
-		return EmailSummary{}, err
+		return MessageSummary{}, err
 	}
 
 	internalDateValue, err := extractQuotedToken(responseLine.line, `INTERNALDATE "`)
 	if err != nil {
-		return EmailSummary{}, err
+		return MessageSummary{}, err
 	}
 
 	receivedAt, err := time.Parse("02-Jan-2006 15:04:05 -0700", internalDateValue)
 	if err != nil {
-		return EmailSummary{}, fmt.Errorf("parse INTERNALDATE %q: %w", internalDateValue, err)
+		return MessageSummary{}, fmt.Errorf("parse INTERNALDATE %q: %w", internalDateValue, err)
 	}
 	flagged := parseFlaggedFromFetchLine(responseLine.line)
 
 	headers, err := mail.ReadMessage(bytes.NewReader(responseLine.literal))
 	if err != nil {
-		return EmailSummary{}, fmt.Errorf("parse message headers: %w", err)
+		return MessageSummary{}, fmt.Errorf("parse message headers: %w", err)
 	}
 
-	return EmailSummary{
+	return MessageSummary{
 		Mailbox:        mailbox,
 		MessageID:      normalizeMessageID(headers.Header.Get("Message-Id")),
 		SequenceNumber: sequenceNumber,
@@ -1546,7 +1543,7 @@ func parseLiteralSize(line string) (int, bool) {
 	return size, true
 }
 
-func (s *IMAPSession) readLiteral(size int) ([]byte, error) {
+func (s *session) readLiteral(size int) ([]byte, error) {
 	literal := make([]byte, size)
 	if _, err := io.ReadFull(s.reader, literal); err != nil {
 		return nil, err
@@ -1636,9 +1633,9 @@ func consumeQuotedString(input string) (string, int, error) {
 	return "", 0, fmt.Errorf("unterminated quoted string: %s", input)
 }
 
-func dedupeEmailSummaries(summaries []EmailSummary) []EmailSummary {
+func dedupeMessageSummaries(summaries []MessageSummary) []MessageSummary {
 	seenMessageIDs := make(map[string]struct{}, len(summaries))
-	deduped := make([]EmailSummary, 0, len(summaries))
+	deduped := make([]MessageSummary, 0, len(summaries))
 
 	for _, summary := range summaries {
 		messageID := normalizeMessageID(summary.MessageID)
@@ -1688,7 +1685,7 @@ func deleteMailboxPriority(mailbox string, isGmailAccount bool) int {
 	}
 }
 
-func (s *IMAPSession) isGmailAccount() bool {
+func (s *session) isGmailAccount() bool {
 	if s == nil || s.client == nil {
 		return false
 	}
@@ -1696,17 +1693,17 @@ func (s *IMAPSession) isGmailAccount() bool {
 	return s.client.isGmail()
 }
 
-func (c *IMAPClient) isGmail() bool {
+func (c *Client) isGmail() bool {
 	if c == nil {
 		return false
 	}
 
-	switch strings.ToLower(strings.TrimSpace(c.Provider)) {
+	switch strings.ToLower(strings.TrimSpace(c.config.Provider)) {
 	case "gmail", "googlemail":
 		return true
 	}
 
-	host, _, err := net.SplitHostPort(strings.TrimSpace(c.Address))
+	host, _, err := net.SplitHostPort(strings.TrimSpace(c.config.Address))
 	if err != nil {
 		return false
 	}
@@ -1714,12 +1711,12 @@ func (c *IMAPClient) isGmail() bool {
 	return strings.EqualFold(host, "imap.gmail.com")
 }
 
-func (c *IMAPClient) isTaggedGmail() bool {
+func (c *Client) isTaggedGmail() bool {
 	if c == nil {
 		return false
 	}
 
-	switch strings.ToLower(strings.TrimSpace(c.Provider)) {
+	switch strings.ToLower(strings.TrimSpace(c.config.Provider)) {
 	case "gmail", "googlemail":
 		return true
 	default:
@@ -1748,7 +1745,7 @@ func isAllMailMailbox(mailbox string) bool {
 	return strings.Contains(mailbox, "all mail")
 }
 
-func (s *IMAPSession) shouldMoveAllMailToTrash(mailbox string) bool {
+func (s *session) shouldMoveAllMailToTrash(mailbox string) bool {
 	if s == nil || s.client == nil {
 		return false
 	}
@@ -1829,9 +1826,9 @@ func isDNSLookupError(err error) bool {
 	return strings.Contains(strings.ToLower(err.Error()), "no such host")
 }
 
-func (s *IMAPSession) reconnect() error {
+func (s *session) reconnect() error {
 	if s == nil || s.client == nil {
-		return fmt.Errorf("imap client is required for reconnect")
+		return fmt.Errorf("client is required for reconnect")
 	}
 	if s.conn != nil {
 		_ = s.conn.Close()
@@ -1845,7 +1842,7 @@ func (s *IMAPSession) reconnect() error {
 	}
 	defer cancel()
 
-	reconnected, err := s.client.Login(ctx)
+	reconnected, err := s.client.login(ctx)
 	if err != nil {
 		return err
 	}

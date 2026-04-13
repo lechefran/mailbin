@@ -8,12 +8,39 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/lechefran/mailbin"
 )
 
-func newAppFromFlags() (*mailbin.App, error) {
+const defaultAccountTimeout = 30 * time.Second
+
+type configuredAccount struct {
+	Name   string
+	Config mailbin.Config
+}
+
+type cliOptions struct {
+	Accounts []configuredAccount
+	Criteria mailbin.DeleteCriteria
+	Timeout  time.Duration
+}
+
+type accountDeleteResult struct {
+	AccountName string
+	Deleted     []mailbin.MessageSummary
+	Err         error
+}
+
+type indexedAccountDeleteResult struct {
+	Index  int
+	Result accountDeleteResult
+}
+
+type deleteFunc func(context.Context, mailbin.Config, mailbin.DeleteCriteria) (mailbin.DeleteResult, error)
+
+func newCLIOptionsFromFlags(now time.Time) (*cliOptions, error) {
 	configPath := flag.String("config", envOrDefault("MAILBIN_CONFIG", ""), "path to accounts config JSON")
 	accountName := flag.String("account", envOrDefault("MAILBIN_ACCOUNT", ""), "account name from config to run")
 	provider := flag.String("provider", envOrDefault("MAILBIN_PROVIDER", ""), "email provider name for built-in IMAP defaults")
@@ -24,18 +51,14 @@ func newAppFromFlags() (*mailbin.App, error) {
 		return nil, err
 	}
 	age := flag.Int("age", ageDefault, "minimum email age in days to delete")
-	includeFlagged := flag.Bool(
-		"include-flagged",
-		envBoolOrDefault("MAILBIN_INCLUDE_FLAGGED", false),
-		"deprecated: flagged/starred emails are never deleted",
-	)
-	timeout := flag.Duration("timeout", 30*time.Second, "connection timeout")
+	timeout := flag.Duration("timeout", defaultAccountTimeout, "connection timeout")
 	flag.Parse()
 
 	if *age < 0 {
 		return nil, fmt.Errorf("age is required and must be 0 or greater")
 	}
 
+	var accounts []configuredAccount
 	if *configPath == "" {
 		password, err := resolvePassword(os.Stdin, os.Stderr, os.Getenv, stdinIsInteractive())
 		if err != nil {
@@ -46,50 +69,115 @@ func newAppFromFlags() (*mailbin.App, error) {
 			return nil, err
 		}
 
-		client := &mailbin.IMAPClient{
-			Provider: *provider,
-			Address:  addressValue,
-			Email:    *email,
-			Password: password,
+		accounts = []configuredAccount{
+			{
+				Name: defaultAccountName("", *email),
+				Config: mailbin.Config{
+					Provider: *provider,
+					Address:  addressValue,
+					Email:    *email,
+					Password: password,
+				},
+			},
 		}
-
-		return &mailbin.App{
-			Client:         client,
-			Age:            *age,
-			IncludeFlagged: *includeFlagged,
-			Timeout:        *timeout,
-			Now:            time.Now,
-		}, nil
+	} else {
+		accounts, err = loadConfiguredAccounts(*configPath, *accountName, os.Stdin, os.Stderr, os.Getenv, stdinIsInteractive())
+		if err != nil {
+			return nil, err
+		}
 	}
 
-	accounts, err := loadConfiguredAccounts(*configPath, *accountName, os.Stdin, os.Stderr, os.Getenv, stdinIsInteractive())
-	if err != nil {
-		return nil, err
-	}
-
-	return &mailbin.App{
-		Accounts:       accounts,
-		Age:            *age,
-		IncludeFlagged: *includeFlagged,
-		Timeout:        *timeout,
-		Now:            time.Now,
+	return &cliOptions{
+		Accounts: accounts,
+		Criteria: mailbin.DeleteCriteria{
+			ReceivedBefore: deleteCutoff(now, *age),
+		},
+		Timeout: *timeout,
 	}, nil
 }
 
 func runCLI(ctx context.Context, output io.Writer) error {
-	app, err := newAppFromFlags()
+	options, err := newCLIOptionsFromFlags(time.Now())
 	if err != nil {
 		return err
 	}
 
-	result, err := app.Run(ctx)
-	if result != nil {
-		if writeErr := writeDeleteOutput(output, result); writeErr != nil {
+	results, err := runConfiguredAccounts(ctx, options, deleteWithClient)
+	if successfulAccountCount(results) > 0 {
+		if writeErr := writeDeleteOutput(output, results); writeErr != nil {
 			return writeErr
 		}
 	}
 
 	return err
+}
+
+func runConfiguredAccounts(ctx context.Context, options *cliOptions, deleteAccount deleteFunc) ([]accountDeleteResult, error) {
+	if options == nil {
+		return nil, fmt.Errorf("cli options are required")
+	}
+	if len(options.Accounts) == 0 {
+		return nil, fmt.Errorf("at least one account is required")
+	}
+	if deleteAccount == nil {
+		deleteAccount = deleteWithClient
+	}
+
+	results := make(chan indexedAccountDeleteResult, len(options.Accounts))
+	var wg sync.WaitGroup
+	for index, account := range options.Accounts {
+		index := index
+		account := account
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+
+			runCtx, cancel := context.WithTimeout(ctx, options.Timeout)
+			defer cancel()
+
+			deleteResult, err := deleteAccount(runCtx, account.Config, options.Criteria)
+			results <- indexedAccountDeleteResult{
+				Index: index,
+				Result: accountDeleteResult{
+					AccountName: account.Name,
+					Deleted:     deleteResult.Deleted,
+					Err:         err,
+				},
+			}
+		}()
+	}
+
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+
+	collected := make([]accountDeleteResult, len(options.Accounts))
+	for result := range results {
+		collected[result.Index] = result.Result
+	}
+
+	failures := make([]string, 0, len(collected))
+	for _, result := range collected {
+		if result.Err != nil {
+			failures = append(failures, fmt.Sprintf("%s: %v", result.AccountName, result.Err))
+		}
+	}
+
+	if len(failures) > 0 {
+		return collected, fmt.Errorf("%d account(s) failed: %s", len(failures), strings.Join(failures, "; "))
+	}
+
+	return collected, nil
+}
+
+func deleteWithClient(ctx context.Context, config mailbin.Config, criteria mailbin.DeleteCriteria) (mailbin.DeleteResult, error) {
+	client, err := mailbin.NewClient(config)
+	if err != nil {
+		return mailbin.DeleteResult{}, err
+	}
+
+	return client.Delete(ctx, criteria)
 }
 
 func resolvePassword(input io.Reader, prompt io.Writer, getenv func(string) string, interactive bool) (string, error) {
@@ -113,46 +201,53 @@ func stdinIsInteractive() bool {
 	return info.Mode()&os.ModeCharDevice != 0
 }
 
-func writeDeleteOutput(output io.Writer, result *mailbin.RunResult) error {
-	if result == nil {
+func writeDeleteOutput(output io.Writer, results []accountDeleteResult) error {
+	if len(results) == 0 {
 		return nil
 	}
-	if err := writeEmailSummaries(output, result.Emails); err != nil {
-		return err
+
+	totalDeleted := 0
+	multipleAccounts := len(results) > 1
+	for _, result := range results {
+		totalDeleted += len(result.Deleted)
+		if err := writeMessageSummaries(output, result.AccountName, multipleAccounts, result.Deleted); err != nil {
+			return err
+		}
 	}
-	if _, err := fmt.Fprintf(output, "deleted %d emails\n", len(result.Emails)); err != nil {
+
+	if _, err := fmt.Fprintf(output, "deleted %d emails\n", totalDeleted); err != nil {
 		return err
 	}
 	_, err := fmt.Fprintf(
 		output,
 		"summary: deleted total=%d emails across accounts=%d (successful=%d failed=%d)\n",
-		len(result.Emails),
-		result.TotalAccounts,
-		result.SuccessfulAccounts(),
-		len(result.Failures),
+		totalDeleted,
+		len(results),
+		successfulAccountCount(results),
+		failedAccountCount(results),
 	)
 	return err
 }
 
-func writeEmailSummaries(output io.Writer, emails []mailbin.EmailSummary) error {
-	for _, email := range emails {
+func writeMessageSummaries(output io.Writer, accountName string, includeAccount bool, summaries []mailbin.MessageSummary) error {
+	for _, summary := range summaries {
 		accountPrefix := ""
-		if email.Account != "" {
-			accountPrefix = fmt.Sprintf("account=%s | ", email.Account)
+		if includeAccount {
+			accountPrefix = fmt.Sprintf("account=%s | ", accountName)
 		}
 		receivedAt := "unknown-time"
-		if !email.ReceivedAt.IsZero() {
-			receivedAt = email.ReceivedAt.Format(time.RFC3339)
+		if !summary.ReceivedAt.IsZero() {
+			receivedAt = summary.ReceivedAt.Format(time.RFC3339)
 		}
-		subject := email.Subject
+		subject := summary.Subject
 		if subject == "" {
 			subject = "-"
 		}
-		from := email.From
+		from := summary.From
 		if from == "" {
 			from = "-"
 		}
-		to := email.To
+		to := summary.To
 		if to == "" {
 			to = "-"
 		}
@@ -161,17 +256,48 @@ func writeEmailSummaries(output io.Writer, emails []mailbin.EmailSummary) error 
 			"%s | %smailbox=%s | %s | from=%s | to=%s | uid=%d\n",
 			receivedAt,
 			accountPrefix,
-			email.Mailbox,
+			summary.Mailbox,
 			subject,
 			from,
 			to,
-			email.UID,
+			summary.UID,
 		); err != nil {
 			return err
 		}
 	}
 
 	return nil
+}
+
+func successfulAccountCount(results []accountDeleteResult) int {
+	successful := 0
+	for _, result := range results {
+		if result.Err == nil {
+			successful++
+		}
+	}
+
+	return successful
+}
+
+func failedAccountCount(results []accountDeleteResult) int {
+	failed := 0
+	for _, result := range results {
+		if result.Err != nil {
+			failed++
+		}
+	}
+
+	return failed
+}
+
+func deleteCutoff(now time.Time, age int) time.Time {
+	return startOfDay(now.AddDate(0, 0, -age)).AddDate(0, 0, 1)
+}
+
+func startOfDay(value time.Time) time.Time {
+	year, month, day := value.Date()
+	return time.Date(year, month, day, 0, 0, 0, 0, value.Location())
 }
 
 func envOrDefault(key, fallback string) string {
@@ -195,18 +321,4 @@ func envIntOrDefault(key string, fallback int) (int, error) {
 	}
 
 	return parsed, nil
-}
-
-func envBoolOrDefault(key string, fallback bool) bool {
-	value := strings.TrimSpace(os.Getenv(key))
-	if value == "" {
-		return fallback
-	}
-
-	parsed, err := strconv.ParseBool(value)
-	if err != nil {
-		return fallback
-	}
-
-	return parsed
 }
