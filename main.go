@@ -18,13 +18,11 @@ const defaultAccountTimeout = 30 * time.Second
 type App struct {
 	Client         *IMAPClient
 	Accounts       []ConfiguredAccount
-	Login          func(context.Context, *IMAPClient) (SessionWithInboxRead, error)
-	Action         string
+	Login          func(context.Context, *IMAPClient) (DeleteSession, error)
 	Age            int
 	IncludeFlagged bool
 	Concurrency    int
 	Timeout        time.Duration
-	Range          string
 	Now            func() time.Time
 	Output         io.Writer
 	PrintEmails    func(io.Writer, []EmailSummary) error
@@ -35,15 +33,7 @@ type ConfiguredAccount struct {
 	Client *IMAPClient
 }
 
-type InboxReader interface {
-	ReadInboxAll() ([]EmailSummary, error)
-	ReadInboxToday(time.Time) ([]EmailSummary, error)
-	ReadInboxThisWeek(time.Time) ([]EmailSummary, error)
-	ReadInboxThisMonth(time.Time) ([]EmailSummary, error)
-}
-
-type SessionWithInboxRead interface {
-	InboxReader
+type DeleteSession interface {
 	DeleteInboxOlderThanDays(time.Time, int, bool) ([]EmailSummary, error)
 	Logout() error
 }
@@ -65,7 +55,7 @@ func (a *App) Run(ctx context.Context) error {
 
 	login := a.Login
 	if login == nil {
-		login = func(ctx context.Context, client *IMAPClient) (SessionWithInboxRead, error) {
+		login = func(ctx context.Context, client *IMAPClient) (DeleteSession, error) {
 			return client.Login(ctx)
 		}
 	}
@@ -105,9 +95,8 @@ func (a *App) Run(ctx context.Context) error {
 
 			runCtx, cancel := context.WithTimeout(ctx, timeout)
 			defer cancel()
-			actionName := normalizedAction(a.Action)
 
-			log.Printf("starting account %s action=%s", account.Name, actionName)
+			log.Printf("starting account %s delete", account.Name)
 			session, err := login(runCtx, account.Client)
 			if err != nil {
 				results <- accountRunResult{
@@ -119,7 +108,7 @@ func (a *App) Run(ctx context.Context) error {
 
 			log.Printf("connected to IMAP server %s as %s", account.Client.Address, account.Client.Email)
 
-			emails, err := a.runAction(session)
+			emails, err := a.deleteByAge(session)
 			logoutErr := session.Logout()
 			if len(accounts) > 1 {
 				for index := range emails {
@@ -149,11 +138,7 @@ func (a *App) Run(ctx context.Context) error {
 				return
 			}
 
-			if actionName == "delete" {
-				log.Printf("finished deletion for account %s: deleted %d emails", account.Name, len(emails))
-			} else {
-				log.Printf("completed account %s action=%s emails=%d", account.Name, actionName, len(emails))
-			}
+			log.Printf("finished deletion for account %s: deleted %d emails", account.Name, len(emails))
 
 			results <- accountRunResult{
 				accountName: account.Name,
@@ -184,10 +169,10 @@ func (a *App) Run(ctx context.Context) error {
 	if err := printEmails(output, allEmails); err != nil {
 		return err
 	}
-	if err := writeActionSummary(output, a.Action, len(allEmails)); err != nil {
+	if err := writeActionSummary(output, len(allEmails)); err != nil {
 		return err
 	}
-	if err := writeCrossAccountSummary(output, a.Action, len(accounts), len(failures), len(allEmails)); err != nil {
+	if err := writeCrossAccountSummary(output, len(accounts), len(failures), len(allEmails)); err != nil {
 		return err
 	}
 
@@ -210,18 +195,16 @@ func main() {
 }
 
 func newAppFromFlags() (*App, error) {
-	action := flag.String("action", envOrDefault("MAILBIN_ACTION", "read"), "action to perform: read or delete")
 	configPath := flag.String("config", envOrDefault("MAILBIN_CONFIG", ""), "path to accounts config JSON")
 	accountName := flag.String("account", envOrDefault("MAILBIN_ACCOUNT", ""), "account name from config to run")
 	provider := flag.String("provider", envOrDefault("MAILBIN_PROVIDER", ""), "email provider name for built-in IMAP defaults")
 	address := flag.String("imap-addr", envOrDefault("MAILBIN_IMAP_ADDR", ""), "IMAP server address in host:port format")
 	email := flag.String("email", envOrDefault("MAILBIN_EMAIL", ""), "email address used for IMAP login")
-	emailRange := flag.String("range", envOrDefault("MAILBIN_RANGE", "all"), "email range to read: all, today, week, or month")
 	ageDefault, err := envIntOrDefault("MAILBIN_AGE", -1)
 	if err != nil {
 		return nil, err
 	}
-	age := flag.Int("age", ageDefault, "minimum email age in days for delete action")
+	age := flag.Int("age", ageDefault, "minimum email age in days to delete")
 	includeFlagged := flag.Bool(
 		"include-flagged",
 		envBoolOrDefault("MAILBIN_INCLUDE_FLAGGED", false),
@@ -230,8 +213,8 @@ func newAppFromFlags() (*App, error) {
 	timeout := flag.Duration("timeout", defaultAccountTimeout, "connection timeout")
 	flag.Parse()
 
-	if *action == "delete" && *age < 0 {
-		return nil, fmt.Errorf("age is required for delete action and must be 0 or greater")
+	if *age < 0 {
+		return nil, fmt.Errorf("age is required and must be 0 or greater")
 	}
 
 	if *configPath == "" {
@@ -253,11 +236,9 @@ func newAppFromFlags() (*App, error) {
 
 		return &App{
 			Client:         client,
-			Action:         *action,
 			Age:            *age,
 			IncludeFlagged: *includeFlagged,
 			Timeout:        *timeout,
-			Range:          *emailRange,
 			Now:            time.Now,
 			Output:         os.Stdout,
 		}, nil
@@ -270,11 +251,9 @@ func newAppFromFlags() (*App, error) {
 
 	return &App{
 		Accounts:       accounts,
-		Action:         *action,
 		Age:            *age,
 		IncludeFlagged: *includeFlagged,
 		Timeout:        *timeout,
-		Range:          *emailRange,
 		Now:            time.Now,
 		Output:         os.Stdout,
 	}, nil
@@ -301,17 +280,6 @@ func stdinIsInteractive() bool {
 	return info.Mode()&os.ModeCharDevice != 0
 }
 
-func (a *App) runAction(session SessionWithInboxRead) ([]EmailSummary, error) {
-	switch a.Action {
-	case "", "read":
-		return a.readByRange(session)
-	case "delete":
-		return a.deleteByAge(session)
-	default:
-		return nil, fmt.Errorf("invalid action %q: must be read or delete", a.Action)
-	}
-}
-
 func (a *App) resolveAccounts() ([]ConfiguredAccount, error) {
 	if len(a.Accounts) > 0 {
 		return a.Accounts, nil
@@ -328,29 +296,9 @@ func (a *App) resolveAccounts() ([]ConfiguredAccount, error) {
 	return nil, fmt.Errorf("at least one account is required")
 }
 
-func (a *App) readByRange(session InboxReader) ([]EmailSummary, error) {
-	now := time.Now
-	if a.Now != nil {
-		now = a.Now
-	}
-
-	switch a.Range {
-	case "", "all":
-		return session.ReadInboxAll()
-	case "today":
-		return session.ReadInboxToday(now())
-	case "week":
-		return session.ReadInboxThisWeek(now())
-	case "month":
-		return session.ReadInboxThisMonth(now())
-	default:
-		return nil, fmt.Errorf("invalid range %q: must be one of all, today, week, or month", a.Range)
-	}
-}
-
-func (a *App) deleteByAge(session SessionWithInboxRead) ([]EmailSummary, error) {
+func (a *App) deleteByAge(session DeleteSession) ([]EmailSummary, error) {
 	if a.Age < 0 {
-		return nil, fmt.Errorf("age is required for delete action and must be 0 or greater")
+		return nil, fmt.Errorf("age is required and must be 0 or greater")
 	}
 
 	now := time.Now
@@ -401,45 +349,22 @@ func writeEmailSummaries(output io.Writer, emails []EmailSummary) error {
 	return nil
 }
 
-func writeActionSummary(output io.Writer, action string, count int) error {
-	switch action {
-	case "", "read":
-		_, err := fmt.Fprintf(output, "retrieved %d emails\n", count)
-		return err
-	case "delete":
-		_, err := fmt.Fprintf(output, "deleted %d emails\n", count)
-		return err
-	default:
-		return fmt.Errorf("invalid action %q: must be read or delete", action)
-	}
+func writeActionSummary(output io.Writer, count int) error {
+	_, err := fmt.Fprintf(output, "deleted %d emails\n", count)
+	return err
 }
 
-func writeCrossAccountSummary(output io.Writer, action string, totalAccounts, failedAccounts, totalEmails int) error {
+func writeCrossAccountSummary(output io.Writer, totalAccounts, failedAccounts, totalEmails int) error {
 	successfulAccounts := totalAccounts - failedAccounts
-	switch action {
-	case "", "read":
-		_, err := fmt.Fprintf(
-			output,
-			"summary: read total=%d emails across accounts=%d (successful=%d failed=%d)\n",
-			totalEmails,
-			totalAccounts,
-			successfulAccounts,
-			failedAccounts,
-		)
-		return err
-	case "delete":
-		_, err := fmt.Fprintf(
-			output,
-			"summary: deleted total=%d emails across accounts=%d (successful=%d failed=%d)\n",
-			totalEmails,
-			totalAccounts,
-			successfulAccounts,
-			failedAccounts,
-		)
-		return err
-	default:
-		return fmt.Errorf("invalid action %q: must be read or delete", action)
-	}
+	_, err := fmt.Fprintf(
+		output,
+		"summary: deleted total=%d emails across accounts=%d (successful=%d failed=%d)\n",
+		totalEmails,
+		totalAccounts,
+		successfulAccounts,
+		failedAccounts,
+	)
+	return err
 }
 
 func defaultAccountName(email string) string {
@@ -448,14 +373,6 @@ func defaultAccountName(email string) string {
 	}
 
 	return email
-}
-
-func normalizedAction(action string) string {
-	if action == "" {
-		return "read"
-	}
-
-	return action
 }
 
 func envOrDefault(key, fallback string) string {
