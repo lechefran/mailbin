@@ -1,6 +1,7 @@
 package mailbin
 
 import (
+	"errors"
 	"strings"
 	"testing"
 )
@@ -46,6 +47,12 @@ func TestResolveIMAPAddress(t *testing.T) {
 			if testCase.wantErrorText != "" {
 				if err == nil || !strings.Contains(err.Error(), testCase.wantErrorText) {
 					t.Fatalf("ResolveIMAPAddress() error = %v, want %q", err, testCase.wantErrorText)
+				}
+				if testCase.wantErrorText == "imap address or provider is required" && !errors.Is(err, ErrIMAPAddressOrProviderRequired) {
+					t.Fatalf("ResolveIMAPAddress() error = %v, want ErrIMAPAddressOrProviderRequired", err)
+				}
+				if testCase.wantErrorText == `unsupported provider "fastmail"` && !errors.Is(err, ErrUnsupportedProvider) {
+					t.Fatalf("ResolveIMAPAddress() error = %v, want ErrUnsupportedProvider", err)
 				}
 				return
 			}

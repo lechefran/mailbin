@@ -1,4 +1,4 @@
-package mailbin
+package imap
 
 import (
 	"bufio"
@@ -66,6 +66,18 @@ var providerIMAPAddresses = map[string]string{
 	"zoho":         imapAddressZoho,
 }
 
+var (
+	ErrIMAPAddressOrProviderRequired = errors.New("imap address or provider is required")
+	ErrUnsupportedProvider           = errors.New("unsupported provider")
+	ErrClientRequired                = errors.New("client is required")
+	ErrIMAPAddressRequired           = errors.New("imap address is required")
+	ErrEmailRequired                 = errors.New("email is required")
+	ErrPasswordRequired              = errors.New("password is required")
+	ErrReceivedBeforeRequired        = errors.New("received before is required")
+	ErrLoginFailed                   = errors.New("login failed")
+	ErrDeleteIncomplete              = errors.New("delete incomplete")
+)
+
 type Config struct {
 	Provider       string
 	Address        string
@@ -103,6 +115,51 @@ type MessageSummary struct {
 	To             string
 }
 
+type DeleteResult struct {
+	Deleted                     []MessageSummary
+	Incomplete                  bool
+	RemainingMatchingCount      int
+	RemainingMatchingCountKnown bool
+	SkippedMailboxCount         int
+}
+
+type DeleteIncompleteError struct {
+	RemainingMatchingCount      int
+	RemainingMatchingCountKnown bool
+	SkippedMailboxCount         int
+	Cause                       error
+}
+
+func (e *DeleteIncompleteError) Error() string {
+	if e == nil {
+		return ErrDeleteIncomplete.Error()
+	}
+
+	switch {
+	case e.RemainingMatchingCountKnown:
+		return fmt.Sprintf("%s: %d emails still match delete criteria", ErrDeleteIncomplete, e.RemainingMatchingCount)
+	case e.SkippedMailboxCount > 0:
+		return fmt.Sprintf("%s: unable to verify %d mailbox(es)", ErrDeleteIncomplete, e.SkippedMailboxCount)
+	case e.Cause != nil:
+		return fmt.Sprintf("%s: %v", ErrDeleteIncomplete, e.Cause)
+	default:
+		return ErrDeleteIncomplete.Error()
+	}
+}
+
+func (e *DeleteIncompleteError) Unwrap() []error {
+	if e == nil {
+		return nil
+	}
+
+	errs := []error{ErrDeleteIncomplete}
+	if e.Cause != nil {
+		errs = append(errs, e.Cause)
+	}
+
+	return errs
+}
+
 type imapResponseLine struct {
 	line    string
 	literal []byte
@@ -110,6 +167,24 @@ type imapResponseLine struct {
 
 var fetchBatchSize = defaultFetchBatchSize
 var deleteBatchSize = defaultDeleteBatchSize
+
+func NewClient(config Config) (*Client, error) {
+	config.Provider = strings.TrimSpace(config.Provider)
+	config.Email = strings.TrimSpace(config.Email)
+
+	address, err := ResolveIMAPAddress(config.Provider, config.Address)
+	if err != nil {
+		return nil, err
+	}
+	config.Address = address
+
+	client := &Client{config: config}
+	if err := client.validate(); err != nil {
+		return nil, err
+	}
+
+	return client, nil
+}
 
 func ResolveIMAPAddress(provider string, address string) (string, error) {
 	address = strings.TrimSpace(address)
@@ -119,12 +194,12 @@ func ResolveIMAPAddress(provider string, address string) (string, error) {
 
 	normalizedProvider := strings.ToLower(strings.TrimSpace(provider))
 	if normalizedProvider == "" {
-		return "", fmt.Errorf("imap address or provider is required")
+		return "", ErrIMAPAddressOrProviderRequired
 	}
 
 	resolvedAddress, ok := providerIMAPAddresses[normalizedProvider]
 	if !ok {
-		return "", fmt.Errorf("unsupported provider %q", provider)
+		return "", fmt.Errorf("%w %q", ErrUnsupportedProvider, provider)
 	}
 
 	return resolvedAddress, nil
@@ -175,7 +250,7 @@ func (c *Client) login(ctx context.Context) (*session, error) {
 
 	if _, _, err := session.runCommand("LOGIN %s %s", email, password); err != nil {
 		conn.Close()
-		return nil, fmt.Errorf("login failed: %w", err)
+		return nil, fmt.Errorf("%w: %v", ErrLoginFailed, err)
 	}
 
 	return session, nil
@@ -184,13 +259,13 @@ func (c *Client) login(ctx context.Context) (*session, error) {
 func (c *Client) validate() error {
 	switch {
 	case c == nil:
-		return fmt.Errorf("client is required")
+		return ErrClientRequired
 	case c.config.Address == "":
-		return fmt.Errorf("imap address is required")
+		return ErrIMAPAddressRequired
 	case c.config.Email == "":
-		return fmt.Errorf("email is required")
+		return ErrEmailRequired
 	case c.config.Password == "":
-		return fmt.Errorf("password is required")
+		return ErrPasswordRequired
 	default:
 		return nil
 	}
@@ -331,14 +406,45 @@ func (s *session) Logout() error {
 }
 
 func (s *session) deleteBefore(before time.Time) ([]MessageSummary, error) {
+	result, err := s.deleteBeforeResult(before)
+	return result.Deleted, err
+}
+
+func (s *session) deleteBeforeResult(before time.Time) (DeleteResult, error) {
 	if before.IsZero() {
-		return nil, fmt.Errorf("received before is required")
+		return DeleteResult{}, ErrReceivedBeforeRequired
 	}
 
 	return s.deleteMatchingMessages("BEFORE %s UNFLAGGED", formatIMAPDate(before))
 }
 
-func (s *session) deleteMatchingMessages(format string, args ...any) ([]MessageSummary, error) {
+func (c *Client) DeleteBefore(ctx context.Context, before time.Time) (DeleteResult, error) {
+	if c == nil {
+		return DeleteResult{}, ErrClientRequired
+	}
+	if before.IsZero() {
+		return DeleteResult{}, ErrReceivedBeforeRequired
+	}
+
+	session, err := c.login(ctx)
+	if err != nil {
+		return DeleteResult{}, err
+	}
+
+	result, deleteErr := session.deleteBeforeResult(before)
+	logoutErr := session.Logout()
+
+	if deleteErr != nil {
+		return result, deleteErr
+	}
+	if logoutErr != nil && !isTimeoutError(logoutErr) {
+		return result, logoutErr
+	}
+
+	return result, nil
+}
+
+func (s *session) deleteMatchingMessages(format string, args ...any) (DeleteResult, error) {
 	var deletedSummaries []MessageSummary
 	var firstErr error
 
@@ -399,10 +505,10 @@ deletePasses:
 
 		if successfulMailboxScans == 0 && firstErr != nil && len(deletedSummaries) == 0 {
 			if isRetryableConnectionError(firstErr) {
-				s.logf("delete pass %d: only retryable connection errors encountered; skipping failure: %v", pass+1, firstErr)
-				return nil, nil
+				s.logf("delete pass %d: only retryable connection errors encountered; returning incomplete result: %v", pass+1, firstErr)
+				return DeleteResult{Incomplete: true}, &DeleteIncompleteError{Cause: firstErr}
 			}
-			return nil, firstErr
+			return DeleteResult{}, firstErr
 		}
 
 		if passDeletedCount == 0 && passMovedToTrashCount == 0 {
@@ -424,29 +530,43 @@ deletePasses:
 
 	if len(deletedSummaries) == 0 && firstErr != nil {
 		if isRetryableConnectionError(firstErr) {
-			s.logf("delete completed with only retryable connection errors; returning no deletions without failing: %v", firstErr)
-			return nil, nil
+			s.logf("delete completed with only retryable connection errors; returning incomplete result: %v", firstErr)
+			return DeleteResult{Incomplete: true}, &DeleteIncompleteError{Cause: firstErr}
 		}
-		return nil, firstErr
+		return DeleteResult{}, firstErr
 	}
 
 	deletedSummaries = dedupeMessageSummaries(deletedSummaries)
-	remainingCount, err := s.checkDeleteCompletion(format, args...)
+	result := DeleteResult{Deleted: deletedSummaries}
+	remainingCount, skippedMailboxCount, err := s.checkDeleteCompletion(format, args...)
 	if err != nil {
 		s.logf("delete incomplete: unable to verify all mailboxes: %v", err)
-		return deletedSummaries, fmt.Errorf("delete incomplete: unable to verify all mailboxes: %w", err)
+		result.Incomplete = true
+		result.SkippedMailboxCount = skippedMailboxCount
+		return result, &DeleteIncompleteError{
+			SkippedMailboxCount: skippedMailboxCount,
+			Cause:               err,
+		}
 	}
-	if remainingCount > 0 {
-		return deletedSummaries, fmt.Errorf("delete incomplete: %d emails still match delete criteria", remainingCount)
+	if remainingCount > 0 || skippedMailboxCount > 0 {
+		result.Incomplete = true
+		result.RemainingMatchingCount = remainingCount
+		result.RemainingMatchingCountKnown = remainingCount > 0
+		result.SkippedMailboxCount = skippedMailboxCount
+		return result, &DeleteIncompleteError{
+			RemainingMatchingCount:      remainingCount,
+			RemainingMatchingCountKnown: remainingCount > 0,
+			SkippedMailboxCount:         skippedMailboxCount,
+		}
 	}
 
-	return deletedSummaries, nil
+	return result, nil
 }
 
-func (s *session) checkDeleteCompletion(format string, args ...any) (int, error) {
+func (s *session) checkDeleteCompletion(format string, args ...any) (int, int, error) {
 	mailboxes, err := s.listMailboxes()
 	if err != nil {
-		return 0, fmt.Errorf("list mailboxes for delete verification: %w", err)
+		return 0, 0, fmt.Errorf("list mailboxes for delete verification: %w", err)
 	}
 
 	mailboxes = prioritizeDeleteMailboxes(mailboxes, s.isGmailAccount())
@@ -455,7 +575,7 @@ func (s *session) checkDeleteCompletion(format string, args ...any) (int, error)
 	for _, mailbox := range mailboxes {
 		if err := s.deleteSelectMailboxWithRetry(mailbox); err != nil {
 			if isRetryableConnectionError(err) {
-				return remainingCount, fmt.Errorf("select mailbox %s for delete verification: %w", mailbox, err)
+				return remainingCount, skippedMailboxCount, fmt.Errorf("select mailbox %s for delete verification: %w", mailbox, err)
 			}
 			skippedMailboxCount++
 			s.logf("delete verification: skipping mailbox %s after select error: %v", mailbox, err)
@@ -465,7 +585,7 @@ func (s *session) checkDeleteCompletion(format string, args ...any) (int, error)
 		uids, err := s.deleteSearchUIDsWithRetry(mailbox, format, args...)
 		if err != nil {
 			if isRetryableConnectionError(err) {
-				return remainingCount, fmt.Errorf("search mailbox %s for delete verification: %w", mailbox, err)
+				return remainingCount, skippedMailboxCount, fmt.Errorf("search mailbox %s for delete verification: %w", mailbox, err)
 			}
 			skippedMailboxCount++
 			s.logf("delete verification: skipping mailbox %s after search error: %v", mailbox, err)
@@ -478,7 +598,7 @@ func (s *session) checkDeleteCompletion(format string, args ...any) (int, error)
 		summaries, err := s.fetchMessageSummariesByUID(mailbox, uids)
 		if err != nil {
 			if isRetryableConnectionError(err) {
-				return remainingCount, fmt.Errorf("fetch mailbox %s for delete verification: %w", mailbox, err)
+				return remainingCount, skippedMailboxCount, fmt.Errorf("fetch mailbox %s for delete verification: %w", mailbox, err)
 			}
 			skippedMailboxCount++
 			s.logf("delete verification: skipping mailbox %s after fetch error: %v", mailbox, err)
@@ -510,11 +630,11 @@ func (s *session) checkDeleteCompletion(format string, args ...any) (int, error)
 			remainingCount,
 			skippedMailboxCount,
 		)
-		return remainingCount, nil
+		return remainingCount, skippedMailboxCount, nil
 	}
 
 	s.logf("delete complete: no emails matching delete criteria remain across account (skipped_mailboxes=%d)", skippedMailboxCount)
-	return 0, nil
+	return 0, skippedMailboxCount, nil
 }
 
 func (s *session) deleteMailboxWithRetry(mailbox string, format string, args ...any) ([]MessageSummary, int, bool, error) {

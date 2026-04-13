@@ -30,7 +30,7 @@ type cliOptions struct {
 
 type accountDeleteResult struct {
 	AccountName string
-	Deleted     []mailbin.MessageSummary
+	Result      mailbin.DeleteResult
 	Err         error
 }
 
@@ -141,7 +141,7 @@ func runConfiguredAccounts(ctx context.Context, options *cliOptions, deleteAccou
 				Index: index,
 				Result: accountDeleteResult{
 					AccountName: account.Name,
-					Deleted:     deleteResult.Deleted,
+					Result:      deleteResult,
 					Err:         err,
 				},
 			}
@@ -214,8 +214,8 @@ func writeDeleteOutput(output io.Writer, results []accountDeleteResult) error {
 	totalDeleted := 0
 	multipleAccounts := len(results) > 1
 	for _, result := range results {
-		totalDeleted += len(result.Deleted)
-		if err := writeMessageSummaries(output, result.AccountName, multipleAccounts, result.Deleted); err != nil {
+		totalDeleted += len(result.Result.Deleted)
+		if err := writeMessageSummaries(output, result.AccountName, multipleAccounts, result.Result.Deleted); err != nil {
 			return err
 		}
 	}

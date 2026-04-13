@@ -76,14 +76,16 @@ func TestWriteDeleteOutput(t *testing.T) {
 	results := []accountDeleteResult{
 		{
 			AccountName: "gmail",
-			Deleted: []mailbin.MessageSummary{
-				{
-					Mailbox:    "INBOX",
-					ReceivedAt: time.Date(2026, time.April, 1, 8, 0, 0, 0, time.UTC),
-					Subject:    "Today message",
-					From:       "alerts@example.com",
-					To:         "user@example.com",
-					UID:        7,
+			Result: mailbin.DeleteResult{
+				Deleted: []mailbin.MessageSummary{
+					{
+						Mailbox:    "INBOX",
+						ReceivedAt: time.Date(2026, time.April, 1, 8, 0, 0, 0, time.UTC),
+						Subject:    "Today message",
+						From:       "alerts@example.com",
+						To:         "user@example.com",
+						UID:        7,
+					},
 				},
 			},
 		},
@@ -163,7 +165,7 @@ func TestRunConfiguredAccountsRunsConcurrentlyAndPreservesInputOrder(t *testing.
 	if results[0].AccountName != "gmail" || results[1].AccountName != "icloud" {
 		t.Fatalf("runConfiguredAccounts() account order = %#v, want input order", results)
 	}
-	if results[0].Deleted[0].Subject != "one@example.com" || results[1].Deleted[0].Subject != "two@example.com" {
+	if results[0].Result.Deleted[0].Subject != "one@example.com" || results[1].Result.Deleted[0].Subject != "two@example.com" {
 		t.Fatalf("runConfiguredAccounts() deleted = %#v, want per-account results", results)
 	}
 }
@@ -193,5 +195,40 @@ func TestRunConfiguredAccountsAggregatesFailuresInInputOrder(t *testing.T) {
 	}
 	if len(results) != 2 {
 		t.Fatalf("runConfiguredAccounts() results = %v, want 2", results)
+	}
+}
+
+func TestRunConfiguredAccountsPreservesPartialDeleteResults(t *testing.T) {
+	options := &cliOptions{
+		Accounts: []configuredAccount{
+			{Name: "gmail", Config: mailbin.Config{Email: "one@example.com"}},
+		},
+		Criteria: mailbin.DeleteCriteria{ReceivedBefore: time.Date(2026, time.January, 1, 0, 0, 0, 0, time.UTC)},
+		Timeout:  time.Second,
+	}
+
+	results, err := runConfiguredAccounts(context.Background(), options, func(ctx context.Context, config mailbin.Config, criteria mailbin.DeleteCriteria) (mailbin.DeleteResult, error) {
+		return mailbin.DeleteResult{
+			Deleted:                     []mailbin.MessageSummary{{Subject: "partial delete"}},
+			Incomplete:                  true,
+			RemainingMatchingCount:      3,
+			RemainingMatchingCountKnown: true,
+		}, errors.New("delete incomplete")
+	})
+
+	if err == nil {
+		t.Fatal("runConfiguredAccounts() error = nil, want failure")
+	}
+	if len(results) != 1 {
+		t.Fatalf("runConfiguredAccounts() results = %v, want 1", results)
+	}
+	if !results[0].Result.Incomplete {
+		t.Fatalf("runConfiguredAccounts() result = %#v, want incomplete result", results[0].Result)
+	}
+	if len(results[0].Result.Deleted) != 1 || results[0].Result.Deleted[0].Subject != "partial delete" {
+		t.Fatalf("runConfiguredAccounts() deleted = %#v, want partial result preserved", results[0].Result.Deleted)
+	}
+	if !results[0].Result.RemainingMatchingCountKnown || results[0].Result.RemainingMatchingCount != 3 {
+		t.Fatalf("runConfiguredAccounts() result = %#v, want remaining count metadata", results[0].Result)
 	}
 }

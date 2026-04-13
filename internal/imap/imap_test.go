@@ -1,4 +1,4 @@
-package mailbin
+package imap
 
 import (
 	"bufio"
@@ -901,8 +901,15 @@ func TestSessionDeleteBeforeSkipsStoreFailures(t *testing.T) {
 	defer session.Logout()
 
 	deletedEmails, err := session.deleteBefore(deleteCutoff(now, 90))
-	if err == nil || !strings.Contains(err.Error(), "delete incomplete") {
+	if err == nil || !errors.Is(err, ErrDeleteIncomplete) {
 		t.Fatalf("deleteBefore() error = %v, want delete incomplete", err)
+	}
+	var incompleteErr *DeleteIncompleteError
+	if !errors.As(err, &incompleteErr) {
+		t.Fatalf("deleteBefore() error = %v, want DeleteIncompleteError", err)
+	}
+	if !incompleteErr.RemainingMatchingCountKnown || incompleteErr.RemainingMatchingCount != 2 {
+		t.Fatalf("deleteBefore() incomplete error = %#v, want 2 known remaining matches", incompleteErr)
 	}
 	if len(deletedEmails) != 0 {
 		t.Fatalf("deleteBefore() deleted = %v, want no emails deleted on store failures", deletedEmails)
@@ -911,6 +918,67 @@ func TestSessionDeleteBeforeSkipsStoreFailures(t *testing.T) {
 	remainingEmails := readAllMailboxSummariesForTest(t, session)
 	if len(remainingEmails) != 2 {
 		t.Fatalf("remaining emails = %v, want both emails retained", remainingEmails)
+	}
+}
+
+func TestClientDeleteBeforeReturnsIncompleteResultWhenMatchesRemain(t *testing.T) {
+	now := time.Date(2026, time.April, 2, 15, 30, 0, 0, time.UTC)
+	server := newFakeIMAPServer(t, fakeIMAPServerConfig{
+		email:    "user@example.com",
+		password: "correct-password",
+		accept:   true,
+		mailboxes: []fakeIMAPMailbox{
+			{
+				Name:      "Apparel",
+				FailStore: true,
+				Messages: []fakeIMAPMessage{
+					{
+						UID:        101,
+						MessageID:  "<apparel-one@example.com>",
+						ReceivedAt: time.Date(2025, time.December, 1, 8, 0, 0, 0, time.UTC),
+						Subject:    "Apparel one",
+						From:       "one@example.com",
+						To:         "user@example.com",
+					},
+					{
+						UID:        102,
+						MessageID:  "<apparel-two@example.com>",
+						ReceivedAt: time.Date(2025, time.December, 2, 8, 0, 0, 0, time.UTC),
+						Subject:    "Apparel two",
+						From:       "two@example.com",
+						To:         "user@example.com",
+					},
+				},
+			},
+		},
+	})
+	t.Cleanup(server.Close)
+
+	client, err := NewClient(Config{
+		Address:   server.Address(),
+		Email:     "user@example.com",
+		Password:  "correct-password",
+		TLSConfig: server.ClientTLSConfig(),
+	})
+	if err != nil {
+		t.Fatalf("NewClient() error = %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	result, err := client.DeleteBefore(ctx, deleteCutoff(now, 90))
+	if err == nil || !errors.Is(err, ErrDeleteIncomplete) {
+		t.Fatalf("DeleteBefore() error = %v, want delete incomplete", err)
+	}
+	if !result.Incomplete {
+		t.Fatalf("DeleteBefore() result = %#v, want incomplete result", result)
+	}
+	if !result.RemainingMatchingCountKnown || result.RemainingMatchingCount != 2 {
+		t.Fatalf("DeleteBefore() result = %#v, want 2 known remaining matches", result)
+	}
+	if len(result.Deleted) != 0 {
+		t.Fatalf("DeleteBefore() deleted = %v, want no deletions on store failure", result.Deleted)
 	}
 }
 
@@ -1107,8 +1175,15 @@ func TestSessionDeleteBeforeSkipsTimedOutMailboxDeletes(t *testing.T) {
 	defer session.Logout()
 
 	deletedEmails, err := session.deleteBefore(deleteCutoff(now, 90))
-	if err == nil || !strings.Contains(err.Error(), "delete incomplete") {
+	if err == nil || !errors.Is(err, ErrDeleteIncomplete) {
 		t.Fatalf("deleteBefore() error = %v, want delete incomplete", err)
+	}
+	var incompleteErr *DeleteIncompleteError
+	if !errors.As(err, &incompleteErr) {
+		t.Fatalf("deleteBefore() error = %v, want DeleteIncompleteError", err)
+	}
+	if incompleteErr.RemainingMatchingCountKnown {
+		t.Fatalf("deleteBefore() incomplete error = %#v, want unknown remaining count", incompleteErr)
 	}
 
 	if len(deletedEmails) != 2 {
@@ -1177,8 +1252,15 @@ func TestSessionDeleteBeforeReturnsPartialResultsAfterSearchTimeout(t *testing.T
 	defer session.Logout()
 
 	deletedEmails, err := session.deleteBefore(deleteCutoff(now, 90))
-	if err == nil || !strings.Contains(err.Error(), "delete incomplete") {
+	if err == nil || !errors.Is(err, ErrDeleteIncomplete) {
 		t.Fatalf("deleteBefore() error = %v, want delete incomplete", err)
+	}
+	var incompleteErr *DeleteIncompleteError
+	if !errors.As(err, &incompleteErr) {
+		t.Fatalf("deleteBefore() error = %v, want DeleteIncompleteError", err)
+	}
+	if incompleteErr.RemainingMatchingCountKnown {
+		t.Fatalf("deleteBefore() incomplete error = %#v, want unknown remaining count", incompleteErr)
 	}
 	if len(deletedEmails) != 1 {
 		t.Fatalf("deleteBefore() deleted = %v, want 1 partial delete", deletedEmails)
