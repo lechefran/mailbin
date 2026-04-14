@@ -1,4 +1,4 @@
-package main
+package cliconfig
 
 import (
 	"bufio"
@@ -10,6 +10,11 @@ import (
 
 	"github.com/lechefran/mailbin"
 )
+
+type Account struct {
+	Name   string
+	Config mailbin.Config
+}
 
 type accountsConfig struct {
 	Accounts []accountConfig `json:"accounts"`
@@ -23,23 +28,23 @@ type accountConfig struct {
 	PasswordEnv string `json:"password_env"`
 }
 
-func loadConfiguredAccounts(
+func LoadAccounts(
 	path string,
 	selectedAccount string,
 	input io.Reader,
 	prompt io.Writer,
 	getenv func(string) string,
 	interactive bool,
-) ([]configuredAccount, error) {
+) ([]Account, error) {
 	config, err := readAccountsConfig(path)
 	if err != nil {
 		return nil, err
 	}
 
 	selectedAccount = strings.TrimSpace(selectedAccount)
-	accounts := make([]configuredAccount, 0, len(config.Accounts))
+	accounts := make([]Account, 0, len(config.Accounts))
 	for _, account := range config.Accounts {
-		accountName := defaultAccountName(account.Name, account.Email)
+		accountName := DefaultAccountName(account.Name, account.Email)
 		if selectedAccount != "" && accountName != selectedAccount {
 			continue
 		}
@@ -54,7 +59,7 @@ func loadConfiguredAccounts(
 			return nil, fmt.Errorf("resolve IMAP address for %q: %w", accountName, err)
 		}
 
-		accounts = append(accounts, configuredAccount{
+		accounts = append(accounts, Account{
 			Name: accountName,
 			Config: mailbin.Config{
 				Provider: strings.TrimSpace(account.Provider),
@@ -73,6 +78,32 @@ func loadConfiguredAccounts(
 	}
 
 	return accounts, nil
+}
+
+func ResolvePassword(input io.Reader, prompt io.Writer, getenv func(string) string, interactive bool) (string, error) {
+	if password := getenv("MAILBIN_PASSWORD"); password != "" {
+		return password, nil
+	}
+
+	if !interactive {
+		return "", fmt.Errorf("MAILBIN_PASSWORD is required when stdin is not interactive")
+	}
+
+	return promptPassword(input, prompt, "Enter IMAP password: ")
+}
+
+func DefaultAccountName(name, email string) string {
+	name = strings.TrimSpace(name)
+	if name != "" {
+		return name
+	}
+
+	email = strings.TrimSpace(email)
+	if email != "" {
+		return email
+	}
+
+	return "account"
 }
 
 func readAccountsConfig(path string) (*accountsConfig, error) {
@@ -103,15 +134,15 @@ func resolveConfiguredAccountPassword(
 			return password, nil
 		}
 		if !interactive {
-			return "", fmt.Errorf("%s is required for account %q", passwordEnv, defaultAccountName(account.Name, account.Email))
+			return "", fmt.Errorf("%s is required for account %q", passwordEnv, DefaultAccountName(account.Name, account.Email))
 		}
 	}
 
 	if !interactive {
-		return "", fmt.Errorf("password is required for account %q when stdin is not interactive", defaultAccountName(account.Name, account.Email))
+		return "", fmt.Errorf("password is required for account %q when stdin is not interactive", DefaultAccountName(account.Name, account.Email))
 	}
 
-	promptText := fmt.Sprintf("Enter IMAP password for %s: ", defaultAccountName(account.Name, account.Email))
+	promptText := fmt.Sprintf("Enter IMAP password for %s: ", DefaultAccountName(account.Name, account.Email))
 	return promptPassword(input, prompt, promptText)
 }
 
@@ -131,18 +162,4 @@ func promptPassword(input io.Reader, prompt io.Writer, promptText string) (strin
 	}
 
 	return password, nil
-}
-
-func defaultAccountName(name, email string) string {
-	name = strings.TrimSpace(name)
-	if name != "" {
-		return name
-	}
-
-	email = strings.TrimSpace(email)
-	if email != "" {
-		return email
-	}
-
-	return "account"
 }

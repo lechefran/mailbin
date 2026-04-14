@@ -1,4 +1,4 @@
-package main
+package cliconfig
 
 import (
 	"bytes"
@@ -10,7 +10,67 @@ import (
 	"github.com/lechefran/mailbin"
 )
 
-func TestLoadConfiguredAccountsUsesProviderDefaults(t *testing.T) {
+func TestResolvePassword(t *testing.T) {
+	testCases := []struct {
+		name          string
+		input         string
+		envValue      string
+		interactive   bool
+		wantPassword  string
+		wantPrompt    string
+		wantErrorText string
+	}{
+		{
+			name:         "uses env password",
+			envValue:     "env-secret",
+			interactive:  false,
+			wantPassword: "env-secret",
+		},
+		{
+			name:         "prompts on interactive stdin",
+			input:        "typed-secret\n",
+			interactive:  true,
+			wantPassword: "typed-secret",
+			wantPrompt:   "Enter IMAP password: ",
+		},
+		{
+			name:          "errors on non interactive stdin",
+			interactive:   false,
+			wantErrorText: "MAILBIN_PASSWORD is required",
+		},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			prompt := &bytes.Buffer{}
+			password, err := ResolvePassword(
+				strings.NewReader(testCase.input),
+				prompt,
+				func(string) string { return testCase.envValue },
+				testCase.interactive,
+			)
+
+			if testCase.wantErrorText != "" {
+				if err == nil || !strings.Contains(err.Error(), testCase.wantErrorText) {
+					t.Fatalf("ResolvePassword() error = %v, want %q", err, testCase.wantErrorText)
+				}
+				return
+			}
+
+			if err != nil {
+				t.Fatalf("ResolvePassword() error = %v", err)
+			}
+			if password != testCase.wantPassword {
+				t.Fatalf("ResolvePassword() password = %q, want %q", password, testCase.wantPassword)
+			}
+			if prompt.String() != testCase.wantPrompt {
+				t.Fatalf("ResolvePassword() prompt = %q, want %q", prompt.String(), testCase.wantPrompt)
+			}
+		})
+	}
+}
+
+func TestLoadAccountsUsesProviderDefaults(t *testing.T) {
 	configPath := writeAccountsConfig(t, `{
   "accounts": [
     {
@@ -28,7 +88,7 @@ func TestLoadConfiguredAccountsUsesProviderDefaults(t *testing.T) {
   ]
 }`)
 
-	accounts, err := loadConfiguredAccounts(
+	accounts, err := LoadAccounts(
 		configPath,
 		"",
 		strings.NewReader(""),
@@ -46,10 +106,10 @@ func TestLoadConfiguredAccountsUsesProviderDefaults(t *testing.T) {
 		false,
 	)
 	if err != nil {
-		t.Fatalf("loadConfiguredAccounts() error = %v", err)
+		t.Fatalf("LoadAccounts() error = %v", err)
 	}
 	if len(accounts) != 2 {
-		t.Fatalf("loadConfiguredAccounts() count = %d, want 2", len(accounts))
+		t.Fatalf("LoadAccounts() count = %d, want 2", len(accounts))
 	}
 	if accounts[0].Config.Address != mailbin.GMAIL {
 		t.Fatalf("first account address = %q, want %q", accounts[0].Config.Address, mailbin.GMAIL)
@@ -62,7 +122,7 @@ func TestLoadConfiguredAccountsUsesProviderDefaults(t *testing.T) {
 	}
 }
 
-func TestLoadConfiguredAccountsSelectsOneAccount(t *testing.T) {
+func TestLoadAccountsSelectsOneAccount(t *testing.T) {
 	configPath := writeAccountsConfig(t, `{
   "accounts": [
     {
@@ -80,7 +140,7 @@ func TestLoadConfiguredAccountsSelectsOneAccount(t *testing.T) {
   ]
 }`)
 
-	accounts, err := loadConfiguredAccounts(
+	accounts, err := LoadAccounts(
 		configPath,
 		"icloud",
 		strings.NewReader(""),
@@ -94,10 +154,10 @@ func TestLoadConfiguredAccountsSelectsOneAccount(t *testing.T) {
 		false,
 	)
 	if err != nil {
-		t.Fatalf("loadConfiguredAccounts() error = %v", err)
+		t.Fatalf("LoadAccounts() error = %v", err)
 	}
 	if len(accounts) != 1 {
-		t.Fatalf("loadConfiguredAccounts() count = %d, want 1", len(accounts))
+		t.Fatalf("LoadAccounts() count = %d, want 1", len(accounts))
 	}
 	if accounts[0].Name != "icloud" {
 		t.Fatalf("selected account = %q, want icloud", accounts[0].Name)
@@ -107,7 +167,7 @@ func TestLoadConfiguredAccountsSelectsOneAccount(t *testing.T) {
 	}
 }
 
-func TestLoadConfiguredAccountsUsesAddressOverride(t *testing.T) {
+func TestLoadAccountsUsesAddressOverride(t *testing.T) {
 	configPath := writeAccountsConfig(t, `{
   "accounts": [
     {
@@ -120,7 +180,7 @@ func TestLoadConfiguredAccountsUsesAddressOverride(t *testing.T) {
   ]
 }`)
 
-	accounts, err := loadConfiguredAccounts(
+	accounts, err := LoadAccounts(
 		configPath,
 		"",
 		strings.NewReader(""),
@@ -134,7 +194,7 @@ func TestLoadConfiguredAccountsUsesAddressOverride(t *testing.T) {
 		false,
 	)
 	if err != nil {
-		t.Fatalf("loadConfiguredAccounts() error = %v", err)
+		t.Fatalf("LoadAccounts() error = %v", err)
 	}
 	if accounts[0].Config.Address != "imap.custom.example:993" {
 		t.Fatalf("override address = %q, want custom address", accounts[0].Config.Address)

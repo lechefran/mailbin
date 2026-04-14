@@ -13,14 +13,12 @@ import (
 	"time"
 
 	"github.com/lechefran/mailbin"
+	"github.com/lechefran/mailbin/internal/cliconfig"
 )
 
 const defaultAccountTimeout = 30 * time.Second
 
-type configuredAccount struct {
-	Name   string
-	Config mailbin.Config
-}
+type configuredAccount = cliconfig.Account
 
 type cliOptions struct {
 	Accounts []configuredAccount
@@ -61,7 +59,7 @@ func newCLIOptionsFromFlags(now time.Time) (*cliOptions, error) {
 
 	var accounts []configuredAccount
 	if *configPath == "" {
-		password, err := resolvePassword(os.Stdin, os.Stderr, os.Getenv, stdinIsInteractive())
+		password, err := cliconfig.ResolvePassword(os.Stdin, os.Stderr, os.Getenv, stdinIsInteractive())
 		if err != nil {
 			return nil, err
 		}
@@ -72,7 +70,7 @@ func newCLIOptionsFromFlags(now time.Time) (*cliOptions, error) {
 
 		accounts = []configuredAccount{
 			{
-				Name: defaultAccountName("", *email),
+				Name: cliconfig.DefaultAccountName("", *email),
 				Config: mailbin.Config{
 					Provider: *provider,
 					Address:  addressValue,
@@ -82,7 +80,7 @@ func newCLIOptionsFromFlags(now time.Time) (*cliOptions, error) {
 			},
 		}
 	} else {
-		accounts, err = loadConfiguredAccounts(*configPath, *accountName, os.Stdin, os.Stderr, os.Getenv, stdinIsInteractive())
+		accounts, err = cliconfig.LoadAccounts(*configPath, *accountName, os.Stdin, os.Stderr, os.Getenv, stdinIsInteractive())
 		if err != nil {
 			return nil, err
 		}
@@ -127,8 +125,6 @@ func runConfiguredAccounts(ctx context.Context, options *cliOptions, deleteAccou
 	results := make(chan indexedAccountDeleteResult, len(options.Accounts))
 	var wg sync.WaitGroup
 	for index, account := range options.Accounts {
-		index := index
-		account := account
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -183,18 +179,6 @@ func deleteWithClient(ctx context.Context, config mailbin.Config, criteria mailb
 	}
 
 	return client.Delete(ctx, criteria)
-}
-
-func resolvePassword(input io.Reader, prompt io.Writer, getenv func(string) string, interactive bool) (string, error) {
-	if password := getenv("MAILBIN_PASSWORD"); password != "" {
-		return password, nil
-	}
-
-	if !interactive {
-		return "", fmt.Errorf("MAILBIN_PASSWORD is required when stdin is not interactive")
-	}
-
-	return promptPassword(input, prompt, "Enter IMAP password: ")
 }
 
 func stdinIsInteractive() bool {
