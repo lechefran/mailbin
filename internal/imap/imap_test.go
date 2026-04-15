@@ -148,6 +148,113 @@ func TestClientLoginFallsBackAfterDNSLookupFailure(t *testing.T) {
 	}
 }
 
+func TestEffectiveRetryConfigUsesDefaultsForZeroValues(t *testing.T) {
+	retry := effectiveRetryConfig(Config{
+		DeletePasses:          0,
+		DeleteMailboxAttempts: 0,
+		DeleteCommandRetries:  0,
+		DeleteStoreRetries:    0,
+		DeleteExpungeRetries:  0,
+		MailboxCommandRetries: 0,
+		FetchRetryAttempts:    0,
+		BatchSize:             0,
+	})
+
+	if retry.deletePasses != DefaultDeletePasses {
+		t.Fatalf("deletePasses = %d, want %d", retry.deletePasses, DefaultDeletePasses)
+	}
+	if retry.deleteMailboxAttempts != DefaultDeleteMailboxAttempts {
+		t.Fatalf("deleteMailboxAttempts = %d, want %d", retry.deleteMailboxAttempts, DefaultDeleteMailboxAttempts)
+	}
+	if retry.deleteCommandRetries != DefaultDeleteCommandRetries {
+		t.Fatalf("deleteCommandRetries = %d, want %d", retry.deleteCommandRetries, DefaultDeleteCommandRetries)
+	}
+	if retry.deleteStoreRetries != DefaultDeleteStoreRetries {
+		t.Fatalf("deleteStoreRetries = %d, want %d", retry.deleteStoreRetries, DefaultDeleteStoreRetries)
+	}
+	if retry.deleteExpungeRetries != DefaultDeleteExpungeRetries {
+		t.Fatalf("deleteExpungeRetries = %d, want %d", retry.deleteExpungeRetries, DefaultDeleteExpungeRetries)
+	}
+	if retry.mailboxCommandRetries != DefaultMailboxCommandRetries {
+		t.Fatalf("mailboxCommandRetries = %d, want %d", retry.mailboxCommandRetries, DefaultMailboxCommandRetries)
+	}
+	if retry.fetchRetryAttempts != DefaultFetchRetryAttempts {
+		t.Fatalf("fetchRetryAttempts = %d, want %d", retry.fetchRetryAttempts, DefaultFetchRetryAttempts)
+	}
+	if retry.batchSize != DefaultBatchSize {
+		t.Fatalf("batchSize = %d, want %d", retry.batchSize, DefaultBatchSize)
+	}
+}
+
+func TestEffectiveRetryConfigUsesConfiguredValues(t *testing.T) {
+	retry := effectiveRetryConfig(Config{
+		DeletePasses:          4,
+		DeleteMailboxAttempts: 6,
+		DeleteCommandRetries:  7,
+		DeleteStoreRetries:    8,
+		DeleteExpungeRetries:  9,
+		MailboxCommandRetries: 10,
+		FetchRetryAttempts:    11,
+		BatchSize:             12,
+	})
+
+	if retry.deletePasses != 4 {
+		t.Fatalf("deletePasses = %d, want 4", retry.deletePasses)
+	}
+	if retry.deleteMailboxAttempts != 6 {
+		t.Fatalf("deleteMailboxAttempts = %d, want 6", retry.deleteMailboxAttempts)
+	}
+	if retry.deleteCommandRetries != 7 {
+		t.Fatalf("deleteCommandRetries = %d, want 7", retry.deleteCommandRetries)
+	}
+	if retry.deleteStoreRetries != 8 {
+		t.Fatalf("deleteStoreRetries = %d, want 8", retry.deleteStoreRetries)
+	}
+	if retry.deleteExpungeRetries != 9 {
+		t.Fatalf("deleteExpungeRetries = %d, want 9", retry.deleteExpungeRetries)
+	}
+	if retry.mailboxCommandRetries != 10 {
+		t.Fatalf("mailboxCommandRetries = %d, want 10", retry.mailboxCommandRetries)
+	}
+	if retry.fetchRetryAttempts != 11 {
+		t.Fatalf("fetchRetryAttempts = %d, want 11", retry.fetchRetryAttempts)
+	}
+	if retry.batchSize != 12 {
+		t.Fatalf("batchSize = %d, want 12", retry.batchSize)
+	}
+}
+
+func TestValidateNonNegativeTuningConfigRejectsNegativeValues(t *testing.T) {
+	testCases := []struct {
+		name   string
+		config Config
+	}{
+		{name: "DeletePasses", config: Config{DeletePasses: -1}},
+		{name: "DeleteMailboxAttempts", config: Config{DeleteMailboxAttempts: -1}},
+		{name: "DeleteCommandRetries", config: Config{DeleteCommandRetries: -1}},
+		{name: "DeleteStoreRetries", config: Config{DeleteStoreRetries: -1}},
+		{name: "DeleteExpungeRetries", config: Config{DeleteExpungeRetries: -1}},
+		{name: "MailboxCommandRetries", config: Config{MailboxCommandRetries: -1}},
+		{name: "FetchRetryAttempts", config: Config{FetchRetryAttempts: -1}},
+		{name: "BatchSize", config: Config{BatchSize: -1}},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			err := validateNonNegativeTuningConfig(testCase.config)
+			if err == nil {
+				t.Fatalf("validateNonNegativeTuningConfig() error = nil, want %s validation error", testCase.name)
+			}
+			if !errors.Is(err, ErrNegativeConfigValue) {
+				t.Fatalf("validateNonNegativeTuningConfig() error = %v, want ErrNegativeConfigValue", err)
+			}
+			if !strings.Contains(err.Error(), testCase.name) {
+				t.Fatalf("validateNonNegativeTuningConfig() error = %v, want field %q", err, testCase.name)
+			}
+		})
+	}
+}
+
 func TestIsRetryableConnectionError(t *testing.T) {
 	testCases := []struct {
 		name string
@@ -1288,7 +1395,7 @@ func readAllMailboxSummariesForTest(t *testing.T, session *session) []MessageSum
 			t.Fatalf("selectMailboxWithRetry(%q) error = %v", mailbox, err)
 		}
 
-		uids, err := session.searchUIDsWithRetryConfig(mailbox, maxMailboxCommandRetries, 0, "ALL")
+		uids, err := session.searchUIDsWithRetryConfig(mailbox, DefaultMailboxCommandRetries, 0, "ALL")
 		if err != nil {
 			t.Fatalf("searchUIDsWithRetryConfig(%q) error = %v", mailbox, err)
 		}

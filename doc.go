@@ -2,8 +2,7 @@
 //
 // The library focuses on deleting messages for one account at a time.
 // Multi-account orchestration, configuration-file loading, prompting, and
-// process-level logging belong in the consumer application. The bundled CLI in
-// cmd/mailbin is one such consumer.
+// process-level logging belong in the consumer application.
 //
 // Typical usage is:
 //

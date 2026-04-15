@@ -28,16 +28,15 @@ const (
 	imapAddressYahoo     = "imap.mail.yahoo.com:993"
 	imapAddressZoho      = "imap.zoho.com:993"
 
-	maxDeletePasses          = 3
-	maxDeleteMailboxAttempts = 5
-	maxDeleteCommandRetries  = 5
-	maxDeleteStoreRetries    = 5
-	maxDeleteExpungeRetries  = 5
-	maxMailboxCommandRetries = 3
-	maxFetchRetryAttempts    = 3
-	defaultFetchBatchSize    = 20
-	defaultDeleteBatchSize   = 20
-	deleteRetryBackoff       = time.Second
+	DefaultDeletePasses          = 3
+	DefaultDeleteMailboxAttempts = 5
+	DefaultDeleteCommandRetries  = 5
+	DefaultDeleteStoreRetries    = 5
+	DefaultDeleteExpungeRetries  = 5
+	DefaultMailboxCommandRetries = 3
+	DefaultFetchRetryAttempts    = 3
+	DefaultBatchSize             = 20
+	deleteRetryBackoff           = time.Second
 )
 
 const (
@@ -76,6 +75,7 @@ var (
 	ErrReceivedBeforeRequired        = errors.New("received before is required")
 	ErrLoginFailed                   = errors.New("login failed")
 	ErrDeleteIncomplete              = errors.New("delete incomplete")
+	ErrNegativeConfigValue           = errors.New("configuration value cannot be negative")
 )
 
 type Config struct {
@@ -87,10 +87,39 @@ type Config struct {
 	TLSConfig      *tls.Config
 	DialTLSContext func(context.Context, string, *tls.Config) (net.Conn, error)
 	LookupIPAddrs  func(context.Context, string) ([]net.IPAddr, error)
+
+	// DeletePasses controls full delete passes across all mailboxes. Defaults to DefaultDeletePasses.
+	DeletePasses int
+	// DeleteMailboxAttempts controls attempts per mailbox delete flow. Defaults to DefaultDeleteMailboxAttempts.
+	DeleteMailboxAttempts int
+	// DeleteCommandRetries controls retries for mailbox-select/search commands. Defaults to DefaultDeleteCommandRetries.
+	DeleteCommandRetries int
+	// DeleteStoreRetries controls retries for UID STORE/UID MOVE commands. Defaults to DefaultDeleteStoreRetries.
+	DeleteStoreRetries int
+	// DeleteExpungeRetries controls retries for EXPUNGE commands. Defaults to DefaultDeleteExpungeRetries.
+	DeleteExpungeRetries int
+	// MailboxCommandRetries controls retries for LIST/SELECT mailbox commands. Defaults to DefaultMailboxCommandRetries.
+	MailboxCommandRetries int
+	// FetchRetryAttempts controls retries for FETCH summary batches. Defaults to DefaultFetchRetryAttempts.
+	FetchRetryAttempts int
+	// BatchSize controls FETCH and delete processing batch size. Defaults to DefaultBatchSize.
+	BatchSize int
 }
 
 type Client struct {
 	config Config
+	retry  retryConfig
+}
+
+type retryConfig struct {
+	deletePasses          int
+	deleteMailboxAttempts int
+	deleteCommandRetries  int
+	deleteStoreRetries    int
+	deleteExpungeRetries  int
+	mailboxCommandRetries int
+	fetchRetryAttempts    int
+	batchSize             int
 }
 
 type session struct {
@@ -165,9 +194,6 @@ type imapResponseLine struct {
 	literal []byte
 }
 
-var fetchBatchSize = defaultFetchBatchSize
-var deleteBatchSize = defaultDeleteBatchSize
-
 func NewClient(config Config) (*Client, error) {
 	config.Provider = strings.TrimSpace(config.Provider)
 	config.Email = strings.TrimSpace(config.Email)
@@ -177,8 +203,14 @@ func NewClient(config Config) (*Client, error) {
 		return nil, err
 	}
 	config.Address = address
+	if err := validateNonNegativeTuningConfig(config); err != nil {
+		return nil, err
+	}
 
-	client := &Client{config: config}
+	client := &Client{
+		config: config,
+		retry:  effectiveRetryConfig(config),
+	}
 	if err := client.validate(); err != nil {
 		return nil, err
 	}
@@ -203,6 +235,51 @@ func ResolveIMAPAddress(provider string, address string) (string, error) {
 	}
 
 	return resolvedAddress, nil
+}
+
+func effectiveRetryConfig(config Config) retryConfig {
+	return retryConfig{
+		deletePasses:          withPositiveDefault(config.DeletePasses, DefaultDeletePasses),
+		deleteMailboxAttempts: withPositiveDefault(config.DeleteMailboxAttempts, DefaultDeleteMailboxAttempts),
+		deleteCommandRetries:  withPositiveDefault(config.DeleteCommandRetries, DefaultDeleteCommandRetries),
+		deleteStoreRetries:    withPositiveDefault(config.DeleteStoreRetries, DefaultDeleteStoreRetries),
+		deleteExpungeRetries:  withPositiveDefault(config.DeleteExpungeRetries, DefaultDeleteExpungeRetries),
+		mailboxCommandRetries: withPositiveDefault(config.MailboxCommandRetries, DefaultMailboxCommandRetries),
+		fetchRetryAttempts:    withPositiveDefault(config.FetchRetryAttempts, DefaultFetchRetryAttempts),
+		batchSize:             withPositiveDefault(config.BatchSize, DefaultBatchSize),
+	}
+}
+
+func withPositiveDefault(value int, fallback int) int {
+	if value > 0 {
+		return value
+	}
+
+	return fallback
+}
+
+func validateNonNegativeTuningConfig(config Config) error {
+	validatedValues := []struct {
+		name  string
+		value int
+	}{
+		{name: "DeletePasses", value: config.DeletePasses},
+		{name: "DeleteMailboxAttempts", value: config.DeleteMailboxAttempts},
+		{name: "DeleteCommandRetries", value: config.DeleteCommandRetries},
+		{name: "DeleteStoreRetries", value: config.DeleteStoreRetries},
+		{name: "DeleteExpungeRetries", value: config.DeleteExpungeRetries},
+		{name: "MailboxCommandRetries", value: config.MailboxCommandRetries},
+		{name: "FetchRetryAttempts", value: config.FetchRetryAttempts},
+		{name: "BatchSize", value: config.BatchSize},
+	}
+
+	for _, validatedValue := range validatedValues {
+		if validatedValue.value < 0 {
+			return fmt.Errorf("%w: %s", ErrNegativeConfigValue, validatedValue.name)
+		}
+	}
+
+	return nil
 }
 
 func (c *Client) login(ctx context.Context) (*session, error) {
@@ -285,6 +362,25 @@ func (s *session) logf(format string, args ...any) {
 	}
 
 	s.client.logf(format, args...)
+}
+
+func (s *session) retryConfig() retryConfig {
+	if s == nil || s.client == nil {
+		return effectiveRetryConfig(Config{})
+	}
+
+	return s.client.retryConfig()
+}
+
+func (c *Client) retryConfig() retryConfig {
+	if c == nil {
+		return effectiveRetryConfig(Config{})
+	}
+	if c.retry == (retryConfig{}) {
+		return effectiveRetryConfig(c.config)
+	}
+
+	return c.retry
 }
 
 func (c *Client) cloneTLSConfig(serverName string) *tls.Config {
@@ -445,11 +541,12 @@ func (c *Client) DeleteBefore(ctx context.Context, before time.Time) (DeleteResu
 }
 
 func (s *session) deleteMatchingMessages(format string, args ...any) (DeleteResult, error) {
+	retry := s.retryConfig()
 	var deletedSummaries []MessageSummary
 	var firstErr error
 
 deletePasses:
-	for pass := 0; pass < maxDeletePasses; pass++ {
+	for pass := 0; pass < retry.deletePasses; pass++ {
 		mailboxes, err := s.listMailboxes()
 		if err != nil {
 			if firstErr == nil {
@@ -458,7 +555,7 @@ deletePasses:
 			break
 		}
 		mailboxes = prioritizeDeleteMailboxes(mailboxes, s.isGmailAccount())
-		s.logf("delete pass %d/%d: scanning %d mailboxes", pass+1, maxDeletePasses, len(mailboxes))
+		s.logf("delete pass %d/%d: scanning %d mailboxes", pass+1, retry.deletePasses, len(mailboxes))
 
 		passDeletedCount := 0
 		passMovedToTrashCount := 0
@@ -638,13 +735,14 @@ func (s *session) checkDeleteCompletion(format string, args ...any) (int, int, e
 }
 
 func (s *session) deleteMailboxWithRetry(mailbox string, format string, args ...any) ([]MessageSummary, int, bool, error) {
+	retry := s.retryConfig()
 	var lastTimeoutErr error
 	deletedSummaries := make([]MessageSummary, 0)
 	movedToTrashCount := 0
 	hadSearchResults := false
 
 attemptLoop:
-	for attempt := 0; attempt < maxDeleteMailboxAttempts; attempt++ {
+	for attempt := 0; attempt < retry.deleteMailboxAttempts; attempt++ {
 		s.logf("delete mailbox %s: attempt %d", mailbox, attempt+1)
 		if err := s.deleteSelectMailboxWithRetry(mailbox); err != nil {
 			return deletedSummaries, movedToTrashCount, false, err
@@ -663,10 +761,7 @@ attemptLoop:
 		hadSearchResults = true
 		s.logf("delete mailbox %s: matched %d emails", mailbox, len(uids))
 
-		batchSize := deleteBatchSize
-		if batchSize <= 0 {
-			batchSize = defaultDeleteBatchSize
-		}
+		batchSize := retry.batchSize
 
 		attemptDeletedSummaries := make([]MessageSummary, 0, len(uids))
 		attemptMovedToTrashCount := 0
@@ -693,7 +788,7 @@ attemptLoop:
 
 				lastTimeoutErr = err
 				s.logf("retrying mailbox %s delete after timeout: %v", mailbox, err)
-				if attempt == maxDeleteMailboxAttempts-1 {
+				if attempt == retry.deleteMailboxAttempts-1 {
 					continue attemptLoop
 				}
 				sleepRetryBackoff(deleteRetryBackoff)
@@ -747,10 +842,7 @@ func (s *session) deleteSelectedMailboxMessages(summaries []MessageSummary) ([]M
 
 	mailbox := orderedSummaries[0].Mailbox
 	moveToTrashFirst := s.shouldMoveAllMailToTrash(mailbox)
-	batchSize := deleteBatchSize
-	if batchSize <= 0 {
-		batchSize = defaultDeleteBatchSize
-	}
+	batchSize := s.retryConfig().batchSize
 
 	deletedSummaries := make([]MessageSummary, 0, len(orderedSummaries))
 	pendingExpunge := make([]MessageSummary, 0, batchSize)
@@ -893,8 +985,9 @@ func (s *session) deleteSelectedMailboxMessages(summaries []MessageSummary) ([]M
 }
 
 func (s *session) storeDeletedFlagByUIDWithRetry(summary MessageSummary) error {
+	retry := s.retryConfig()
 	var lastErr error
-	for attempt := 0; attempt < maxDeleteStoreRetries; attempt++ {
+	for attempt := 0; attempt < retry.deleteStoreRetries; attempt++ {
 		err := s.storeDeletedFlagByUID(summary.UID)
 		if err == nil {
 			return nil
@@ -909,10 +1002,10 @@ func (s *session) storeDeletedFlagByUIDWithRetry(summary MessageSummary) error {
 			summary.Mailbox,
 			summary.UID,
 			attempt+1,
-			maxDeleteStoreRetries,
+			retry.deleteStoreRetries,
 			err,
 		)
-		if attempt == maxDeleteStoreRetries-1 {
+		if attempt == retry.deleteStoreRetries-1 {
 			break
 		}
 		sleepRetryBackoff(deleteRetryBackoff)
@@ -952,8 +1045,9 @@ func (s *session) moveMessageToTrashByUID(uid uint32, trashMailbox string) error
 }
 
 func (s *session) moveMessageToTrashByUIDWithRetry(summary MessageSummary, trashMailbox string) (bool, error) {
+	retry := s.retryConfig()
 	var lastErr error
-	for attempt := 0; attempt < maxDeleteStoreRetries; attempt++ {
+	for attempt := 0; attempt < retry.deleteStoreRetries; attempt++ {
 		err := s.moveMessageToTrashByUID(summary.UID, trashMailbox)
 		if err == nil {
 			return true, nil
@@ -976,10 +1070,10 @@ func (s *session) moveMessageToTrashByUIDWithRetry(summary MessageSummary, trash
 			summary.Mailbox,
 			summary.UID,
 			attempt+1,
-			maxDeleteStoreRetries,
+			retry.deleteStoreRetries,
 			err,
 		)
-		if attempt == maxDeleteStoreRetries-1 {
+		if attempt == retry.deleteStoreRetries-1 {
 			break
 		}
 		sleepRetryBackoff(deleteRetryBackoff)
@@ -1007,8 +1101,9 @@ func (s *session) reconnectAndSelectMailbox(mailbox string) error {
 }
 
 func (s *session) expungeMailboxWithRetry(mailbox string) error {
+	retry := s.retryConfig()
 	var lastErr error
-	for attempt := 0; attempt < maxDeleteExpungeRetries; attempt++ {
+	for attempt := 0; attempt < retry.deleteExpungeRetries; attempt++ {
 		_, _, err := s.runCommand("EXPUNGE")
 		if err == nil {
 			return nil
@@ -1022,10 +1117,10 @@ func (s *session) expungeMailboxWithRetry(mailbox string) error {
 			"retrying EXPUNGE for mailbox %s after timeout (attempt %d/%d): %v",
 			mailbox,
 			attempt+1,
-			maxDeleteExpungeRetries,
+			retry.deleteExpungeRetries,
 			err,
 		)
-		if attempt == maxDeleteExpungeRetries-1 {
+		if attempt == retry.deleteExpungeRetries-1 {
 			break
 		}
 		sleepRetryBackoff(deleteRetryBackoff)
@@ -1042,9 +1137,10 @@ func (s *session) expungeMailboxWithRetry(mailbox string) error {
 }
 
 func (s *session) listMailboxes() ([]string, error) {
+	retry := s.retryConfig()
 	var lines []imapResponseLine
 	var err error
-	for attempt := 0; attempt < maxMailboxCommandRetries; attempt++ {
+	for attempt := 0; attempt < retry.mailboxCommandRetries; attempt++ {
 		lines, _, err = s.runCommand(`LIST "" "*"`)
 		if err == nil {
 			break
@@ -1056,10 +1152,10 @@ func (s *session) listMailboxes() ([]string, error) {
 		s.logf(
 			"retrying LIST after retryable connection error (attempt %d/%d): %v",
 			attempt+1,
-			maxMailboxCommandRetries,
+			retry.mailboxCommandRetries,
 			err,
 		)
-		if attempt == maxMailboxCommandRetries-1 {
+		if attempt == retry.mailboxCommandRetries-1 {
 			return nil, fmt.Errorf("list mailboxes: %w", err)
 		}
 		if reconnectErr := s.reconnect(); reconnectErr != nil {
@@ -1116,11 +1212,11 @@ func (s *session) selectMailbox(mailbox string) error {
 }
 
 func (s *session) selectMailboxWithRetry(mailbox string) error {
-	return s.selectMailboxWithRetryConfig(mailbox, maxMailboxCommandRetries, 0)
+	return s.selectMailboxWithRetryConfig(mailbox, s.retryConfig().mailboxCommandRetries, 0)
 }
 
 func (s *session) deleteSelectMailboxWithRetry(mailbox string) error {
-	return s.selectMailboxWithRetryConfig(mailbox, maxDeleteCommandRetries, deleteRetryBackoff)
+	return s.selectMailboxWithRetryConfig(mailbox, s.retryConfig().deleteCommandRetries, deleteRetryBackoff)
 }
 
 func (s *session) selectMailboxWithRetryConfig(mailbox string, maxAttempts int, backoff time.Duration) error {
@@ -1303,7 +1399,7 @@ func expandIDRange(segment string) []uint32 {
 }
 
 func (s *session) deleteSearchUIDsWithRetry(mailbox string, format string, args ...any) ([]uint32, error) {
-	return s.searchUIDsWithRetryConfig(mailbox, maxDeleteCommandRetries, deleteRetryBackoff, format, args...)
+	return s.searchUIDsWithRetryConfig(mailbox, s.retryConfig().deleteCommandRetries, deleteRetryBackoff, format, args...)
 }
 
 func (s *session) searchUIDsWithRetryConfig(mailbox string, maxAttempts int, backoff time.Duration, format string, args ...any) ([]uint32, error) {
@@ -1368,10 +1464,7 @@ func (s *session) fetchMessageSummariesInBatches(
 	total int,
 	fetchBatch func(start, end int) ([]MessageSummary, error),
 ) ([]MessageSummary, error) {
-	batchSize := fetchBatchSize
-	if batchSize <= 0 {
-		batchSize = defaultFetchBatchSize
-	}
+	batchSize := s.retryConfig().batchSize
 
 	summaries := make([]MessageSummary, 0, total)
 	for start := 0; start < total; start += batchSize {
@@ -1396,8 +1489,9 @@ func (s *session) fetchBatchWithRetry(
 	end int,
 	fetchBatch func(start, end int) ([]MessageSummary, error),
 ) ([]MessageSummary, error) {
+	retry := s.retryConfig()
 	var lastErr error
-	for attempt := 0; attempt < maxFetchRetryAttempts; attempt++ {
+	for attempt := 0; attempt < retry.fetchRetryAttempts; attempt++ {
 		batchSummaries, err := fetchBatch(start, end)
 		if err == nil {
 			return batchSummaries, nil
@@ -1411,10 +1505,10 @@ func (s *session) fetchBatchWithRetry(
 			"retrying fetch for mailbox %s after timeout (attempt %d/%d): %v",
 			mailbox,
 			attempt+1,
-			maxFetchRetryAttempts,
+			retry.fetchRetryAttempts,
 			err,
 		)
-		if attempt == maxFetchRetryAttempts-1 {
+		if attempt == retry.fetchRetryAttempts-1 {
 			break
 		}
 		if reconnectErr := s.reconnectAndSelectMailbox(mailbox); reconnectErr != nil {

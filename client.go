@@ -44,6 +44,8 @@ var (
 	ErrLoginFailed = internalimap.ErrLoginFailed
 	// ErrDeleteIncomplete indicates that a delete finished with partial progress or incomplete verification.
 	ErrDeleteIncomplete = internalimap.ErrDeleteIncomplete
+	// ErrNegativeConfigValue indicates that a configurable numeric value was negative.
+	ErrNegativeConfigValue = internalimap.ErrNegativeConfigValue
 )
 
 const (
@@ -61,6 +63,25 @@ const (
 	YAHOO = internalimap.YAHOO
 	// ZOHO is the built-in IMAP endpoint for Zoho Mail.
 	ZOHO = internalimap.ZOHO
+)
+
+const (
+	// DefaultDeletePasses is the default number of full mailbox delete passes.
+	DefaultDeletePasses = internalimap.DefaultDeletePasses
+	// DefaultDeleteMailboxAttempts is the default number of attempts per mailbox delete flow.
+	DefaultDeleteMailboxAttempts = internalimap.DefaultDeleteMailboxAttempts
+	// DefaultDeleteCommandRetries is the default retry count for mailbox-select and search commands during delete.
+	DefaultDeleteCommandRetries = internalimap.DefaultDeleteCommandRetries
+	// DefaultDeleteStoreRetries is the default retry count for UID STORE and UID MOVE commands.
+	DefaultDeleteStoreRetries = internalimap.DefaultDeleteStoreRetries
+	// DefaultDeleteExpungeRetries is the default retry count for EXPUNGE commands.
+	DefaultDeleteExpungeRetries = internalimap.DefaultDeleteExpungeRetries
+	// DefaultMailboxCommandRetries is the default retry count for mailbox LIST/SELECT operations.
+	DefaultMailboxCommandRetries = internalimap.DefaultMailboxCommandRetries
+	// DefaultFetchRetryAttempts is the default retry count for FETCH summary batches.
+	DefaultFetchRetryAttempts = internalimap.DefaultFetchRetryAttempts
+	// DefaultBatchSize is the default batch size for fetch and delete processing.
+	DefaultBatchSize = internalimap.DefaultBatchSize
 )
 
 // Client deletes messages for a single account.
