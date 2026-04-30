@@ -114,6 +114,17 @@ result, err := client.Delete(ctx, mailbin.DeleteCriteria{
 
 When both fields are set, messages are deleted if they are older than `ReceivedBefore` or from one of the `FromAccounts` senders.
 
+Include flagged/starred messages:
+
+```go
+result, err := client.Delete(ctx, mailbin.DeleteCriteria{
+	ReceivedBefore:  time.Date(2026, time.January, 1, 0, 0, 0, 0, time.UTC),
+	IncludeFlagged: true,
+})
+```
+
+`IncludeFlagged` defaults to `false`, so flagged/starred messages are excluded unless explicitly enabled.
+
 ## Public API
 
 Core entry points:
@@ -157,6 +168,7 @@ Delete criteria:
 type DeleteCriteria struct {
     ReceivedBefore time.Time
     FromAccounts   []string
+    IncludeFlagged bool
 }
 ```
 
@@ -167,7 +179,8 @@ Behavior:
 - Combines criteria with OR logic when both fields are set.
 - Rejects empty criteria with `ErrDeleteCriteriaRequired`.
 - Returns deleted message summaries.
-- Skips flagged/starred messages.
+- Skips flagged/starred messages by default.
+- Deletes flagged/starred messages only when `IncludeFlagged` is `true`.
 
 `DeleteResult` fields:
 

@@ -42,14 +42,17 @@ func ExampleDeleteCriteria() {
 		FromAccounts: []string{
 			"blocked@example.com",
 		},
+		IncludeFlagged: true,
 	}
 
 	fmt.Println(criteria.ReceivedBefore.Format(time.RFC3339))
 	fmt.Println(criteria.FromAccounts[0])
+	fmt.Println(criteria.IncludeFlagged)
 
 	// Output:
 	// 2026-01-01T00:00:00Z
 	// blocked@example.com
+	// true
 }
 
 func ExampleDeleteIncompleteError() {

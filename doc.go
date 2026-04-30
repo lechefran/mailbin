@@ -18,6 +18,7 @@
 //	result, err := client.Delete(ctx, mailbin.DeleteCriteria{
 //		ReceivedBefore: cutoff,
 //		FromAccounts:   []string{"blocked@example.com"},
+//		IncludeFlagged: false,
 //	})
 //	if err != nil {
 //		if errors.Is(err, mailbin.ErrDeleteIncomplete) {

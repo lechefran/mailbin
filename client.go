@@ -22,6 +22,8 @@ type DeleteCriteria struct {
 	ReceivedBefore time.Time
 	// FromAccounts deletes messages from these sender email accounts regardless of age.
 	FromAccounts []string
+	// IncludeFlagged allows deleting flagged/starred messages. Defaults to false.
+	IncludeFlagged bool
 }
 
 // MessageSummary describes a deleted message.
@@ -117,5 +119,6 @@ func (c *Client) Delete(ctx context.Context, criteria DeleteCriteria) (DeleteRes
 	return c.imap.Delete(ctx, internalimap.DeleteCriteria{
 		ReceivedBefore: criteria.ReceivedBefore,
 		FromAccounts:   criteria.FromAccounts,
+		IncludeFlagged: criteria.IncludeFlagged,
 	})
 }

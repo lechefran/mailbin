@@ -148,6 +148,7 @@ type MessageSummary struct {
 type DeleteCriteria struct {
 	ReceivedBefore time.Time
 	FromAccounts   []string
+	IncludeFlagged bool
 }
 
 type DeleteResult struct {
@@ -561,7 +562,7 @@ func (c *Client) Delete(ctx context.Context, criteria DeleteCriteria) (DeleteRes
 		return DeleteResult{}, err
 	}
 
-	result, deleteErr := session.deleteMatchingMessages(searchCriteria)
+	result, deleteErr := session.deleteMatchingMessages(searchCriteria, criteria.IncludeFlagged)
 	logoutErr := session.Logout()
 
 	if deleteErr != nil {
@@ -580,7 +581,7 @@ func (s *session) deleteCriteriaResult(criteria DeleteCriteria) (DeleteResult, e
 		return DeleteResult{}, err
 	}
 
-	return s.deleteMatchingMessages(searchCriteria)
+	return s.deleteMatchingMessages(searchCriteria, criteria.IncludeFlagged)
 }
 
 func buildDeleteSearchCriteria(criteria DeleteCriteria) (string, error) {
@@ -601,7 +602,12 @@ func buildDeleteSearchCriteria(criteria DeleteCriteria) (string, error) {
 		return "", ErrDeleteCriteriaRequired
 	}
 
-	return buildORSearchTerms(terms) + " UNFLAGGED", nil
+	searchCriteria := buildORSearchTerms(terms)
+	if !criteria.IncludeFlagged {
+		searchCriteria += " UNFLAGGED"
+	}
+
+	return searchCriteria, nil
 }
 
 func normalizeFromAccounts(accounts []string) []string {
@@ -637,7 +643,7 @@ func buildORSearchTerms(terms []string) string {
 	return expression
 }
 
-func (s *session) deleteMatchingMessages(format string, args ...any) (DeleteResult, error) {
+func (s *session) deleteMatchingMessages(format string, includeFlagged bool, args ...any) (DeleteResult, error) {
 	retry := s.retryConfig()
 	var deletedSummaries []MessageSummary
 	var firstErr error
@@ -660,7 +666,7 @@ deletePasses:
 		successfulMailboxScans := 0
 		for _, mailbox := range mailboxes {
 			s.logf("delete pass %d: scanning mailbox %s", pass+1, mailbox)
-			mailboxSummaries, movedToTrashCount, hadSearchResults, err := s.deleteMailboxWithRetry(mailbox, format, args...)
+			mailboxSummaries, movedToTrashCount, hadSearchResults, err := s.deleteMailboxWithRetry(mailbox, format, includeFlagged, args...)
 			if err != nil {
 				if isRetryableConnectionError(err) {
 					s.logf("skipping mailbox %s after retryable connection error during delete: %v", mailbox, err)
@@ -732,7 +738,7 @@ deletePasses:
 
 	deletedSummaries = dedupeMessageSummaries(deletedSummaries)
 	result := DeleteResult{Deleted: deletedSummaries}
-	remainingCount, skippedMailboxCount, err := s.checkDeleteCompletion(format, args...)
+	remainingCount, skippedMailboxCount, err := s.checkDeleteCompletion(format, includeFlagged, args...)
 	if err != nil {
 		s.logf("delete incomplete: unable to verify all mailboxes: %v", err)
 		result.Incomplete = true
@@ -757,7 +763,7 @@ deletePasses:
 	return result, nil
 }
 
-func (s *session) checkDeleteCompletion(format string, args ...any) (int, int, error) {
+func (s *session) checkDeleteCompletion(format string, includeFlagged bool, args ...any) (int, int, error) {
 	mailboxes, err := s.listMailboxes()
 	if err != nil {
 		return 0, 0, fmt.Errorf("list mailboxes for delete verification: %w", err)
@@ -801,7 +807,7 @@ func (s *session) checkDeleteCompletion(format string, args ...any) (int, int, e
 
 		mailboxRemainingCount := 0
 		for _, summary := range summaries {
-			if summary.Flagged {
+			if summary.Flagged && !includeFlagged {
 				continue
 			}
 			mailboxRemainingCount++
@@ -831,7 +837,7 @@ func (s *session) checkDeleteCompletion(format string, args ...any) (int, int, e
 	return 0, skippedMailboxCount, nil
 }
 
-func (s *session) deleteMailboxWithRetry(mailbox string, format string, args ...any) ([]MessageSummary, int, bool, error) {
+func (s *session) deleteMailboxWithRetry(mailbox string, format string, includeFlagged bool, args ...any) ([]MessageSummary, int, bool, error) {
 	retry := s.retryConfig()
 	var lastTimeoutErr error
 	deletedSummaries := make([]MessageSummary, 0)
@@ -895,7 +901,7 @@ attemptLoop:
 				continue attemptLoop
 			}
 
-			deletedBatch, movedToTrashCount := s.deleteSelectedMailboxMessages(summaries)
+			deletedBatch, movedToTrashCount := s.deleteSelectedMailboxMessages(summaries, includeFlagged)
 			attemptDeletedSummaries = append(attemptDeletedSummaries, deletedBatch...)
 			attemptMovedToTrashCount += movedToTrashCount
 		}
@@ -930,7 +936,7 @@ attemptLoop:
 	return nil, 0, hadSearchResults, nil
 }
 
-func (s *session) deleteSelectedMailboxMessages(summaries []MessageSummary) ([]MessageSummary, int) {
+func (s *session) deleteSelectedMailboxMessages(summaries []MessageSummary, includeFlagged bool) ([]MessageSummary, int) {
 	if len(summaries) == 0 {
 		return nil, 0
 	}
@@ -979,7 +985,7 @@ func (s *session) deleteSelectedMailboxMessages(summaries []MessageSummary) ([]M
 				subject,
 			)
 
-			if summary.Flagged {
+			if summary.Flagged && !includeFlagged {
 				s.logf(
 					"skipping email mailbox=%s seq=%d uid=%d received_at=%s message_id=%q subject=%q: flagged/starred",
 					summary.Mailbox,

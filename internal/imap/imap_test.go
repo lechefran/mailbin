@@ -577,6 +577,14 @@ func TestBuildDeleteSearchCriteria(t *testing.T) {
 			},
 			want: `OR BEFORE 01-Jan-2026 FROM "blocked@example.com" UNFLAGGED`,
 		},
+		{
+			name: "include flagged",
+			criteria: DeleteCriteria{
+				ReceivedBefore: before,
+				IncludeFlagged: true,
+			},
+			want: "BEFORE 01-Jan-2026",
+		},
 	}
 
 	for _, testCase := range testCases {
@@ -860,6 +868,69 @@ func TestSessionDeleteBeforeSkipsFlaggedMessages(t *testing.T) {
 	}
 	if remainingEmails[0].Subject != "Flagged old message" {
 		t.Fatalf("remaining subject = %q, want flagged email", remainingEmails[0].Subject)
+	}
+}
+
+func TestSessionDeleteCriteriaIncludesFlaggedWhenRequested(t *testing.T) {
+	now := time.Date(2026, time.April, 2, 15, 30, 0, 0, time.UTC)
+	server := newFakeIMAPServer(t, fakeIMAPServerConfig{
+		email:    "user@example.com",
+		password: "correct-password",
+		accept:   true,
+		mailboxes: []fakeIMAPMailbox{
+			{
+				Name: "INBOX",
+				Messages: []fakeIMAPMessage{
+					{
+						UID:        101,
+						MessageID:  "<flagged-old@example.com>",
+						ReceivedAt: time.Date(2026, time.January, 2, 9, 0, 0, 0, time.UTC),
+						Subject:    "Flagged old message",
+						From:       "flagged@example.com",
+						To:         "user@example.com",
+						Flagged:    true,
+					},
+				},
+			},
+		},
+	})
+	t.Cleanup(server.Close)
+
+	client := &Client{
+		config: Config{
+			Address:   server.Address(),
+			Email:     "user@example.com",
+			Password:  "correct-password",
+			TLSConfig: server.ClientTLSConfig(),
+		},
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	session, err := client.login(ctx)
+	if err != nil {
+		t.Fatalf("Login() error = %v", err)
+	}
+	defer session.Logout()
+
+	result, err := session.deleteCriteriaResult(DeleteCriteria{
+		ReceivedBefore: deleteCutoff(now, 90),
+		IncludeFlagged: true,
+	})
+	if err != nil {
+		t.Fatalf("deleteCriteriaResult() error = %v", err)
+	}
+	if len(result.Deleted) != 1 {
+		t.Fatalf("deleteCriteriaResult() deleted = %v, want 1 flagged email deleted", result.Deleted)
+	}
+	if result.Deleted[0].Subject != "Flagged old message" {
+		t.Fatalf("deleteCriteriaResult() subject = %q, want flagged email", result.Deleted[0].Subject)
+	}
+
+	remainingEmails := readAllMailboxSummariesForTest(t, session)
+	if len(remainingEmails) != 0 {
+		t.Fatalf("remaining emails = %v, want no emails", remainingEmails)
 	}
 }
 
