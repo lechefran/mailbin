@@ -9,6 +9,7 @@ The package is intentionally library-only. It does not ship a CLI, account-file 
 - [Scope](#scope)
 - [Install](#install)
 - [Quick Start](#quick-start)
+- [Delete Criteria Examples](#delete-criteria-examples)
 - [Public API](#public-api)
 - [Provider to IMAP Address Resolution](#provider-to-imap-address-resolution)
 - [Delete Semantics](#delete-semantics)
@@ -23,7 +24,7 @@ The package is intentionally library-only. It does not ship a CLI, account-file 
 ## Scope
 
 - Single-account IMAP delete client.
-- Date cutoff delete criteria.
+- Date cutoff and sender blacklist delete criteria.
 - Delete result metadata including partial completion information.
 - Internal resilience/retry behavior for IMAP operations.
 
@@ -79,6 +80,40 @@ func main() {
 }
 ```
 
+## Delete Criteria Examples
+
+Delete messages older than a cutoff:
+
+```go
+result, err := client.Delete(ctx, mailbin.DeleteCriteria{
+	ReceivedBefore: time.Date(2026, time.January, 1, 0, 0, 0, 0, time.UTC),
+})
+```
+
+Delete messages from blocked sender accounts regardless of age:
+
+```go
+result, err := client.Delete(ctx, mailbin.DeleteCriteria{
+	FromAccounts: []string{
+		"blocked@example.com",
+		"noreply@example.com",
+	},
+})
+```
+
+Combine both criteria:
+
+```go
+result, err := client.Delete(ctx, mailbin.DeleteCriteria{
+	ReceivedBefore: time.Date(2026, time.January, 1, 0, 0, 0, 0, time.UTC),
+	FromAccounts: []string{
+		"blocked@example.com",
+	},
+})
+```
+
+When both fields are set, messages are deleted if they are older than `ReceivedBefore` or from one of the `FromAccounts` senders.
+
 ## Public API
 
 Core entry points:
@@ -121,13 +156,16 @@ Delete criteria:
 ```go
 type DeleteCriteria struct {
     ReceivedBefore time.Time
+    FromAccounts   []string
 }
 ```
 
 Behavior:
 
 - Deletes messages strictly older than `ReceivedBefore`.
-- Rejects zero cutoff with `ErrReceivedBeforeRequired`.
+- Deletes messages from `FromAccounts` regardless of age.
+- Combines criteria with OR logic when both fields are set.
+- Rejects empty criteria with `ErrDeleteCriteriaRequired`.
 - Returns deleted message summaries.
 - Skips flagged/starred messages.
 
@@ -171,6 +209,7 @@ Common exported errors:
 - `ErrIMAPAddressRequired`
 - `ErrEmailRequired`
 - `ErrPasswordRequired`
+- `ErrDeleteCriteriaRequired`
 - `ErrReceivedBeforeRequired`
 - `ErrLoginFailed`
 - `ErrDeleteIncomplete`

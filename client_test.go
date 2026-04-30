@@ -30,7 +30,7 @@ func TestNewClientAcceptsProviderDefaults(t *testing.T) {
 	}
 }
 
-func TestClientDeleteRequiresReceivedBefore(t *testing.T) {
+func TestClientDeleteRequiresCriteria(t *testing.T) {
 	client, err := NewClient(Config{
 		Address:  "imap.example.com:993",
 		Email:    "user@example.com",
@@ -41,7 +41,7 @@ func TestClientDeleteRequiresReceivedBefore(t *testing.T) {
 	}
 
 	_, err = client.Delete(context.Background(), DeleteCriteria{})
-	if err == nil || !errors.Is(err, ErrReceivedBeforeRequired) {
+	if err == nil || !errors.Is(err, ErrDeleteCriteriaRequired) {
 		t.Fatalf("Delete() error = %v, want criteria validation failure", err)
 	}
 }

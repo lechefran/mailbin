@@ -542,6 +542,62 @@ func TestIsUnsupportedMoveError(t *testing.T) {
 	}
 }
 
+func TestBuildDeleteSearchCriteria(t *testing.T) {
+	before := time.Date(2026, time.January, 1, 0, 0, 0, 0, time.UTC)
+
+	testCases := []struct {
+		name     string
+		criteria DeleteCriteria
+		want     string
+		wantErr  error
+	}{
+		{
+			name:    "empty",
+			wantErr: ErrDeleteCriteriaRequired,
+		},
+		{
+			name: "received before only",
+			criteria: DeleteCriteria{
+				ReceivedBefore: before,
+			},
+			want: "BEFORE 01-Jan-2026 UNFLAGGED",
+		},
+		{
+			name: "from accounts only",
+			criteria: DeleteCriteria{
+				FromAccounts: []string{"blocked@example.com", "blocked@example.com", "  other@example.com  "},
+			},
+			want: `OR FROM "blocked@example.com" FROM "other@example.com" UNFLAGGED`,
+		},
+		{
+			name: "received before or from accounts",
+			criteria: DeleteCriteria{
+				ReceivedBefore: before,
+				FromAccounts:   []string{"blocked@example.com"},
+			},
+			want: `OR BEFORE 01-Jan-2026 FROM "blocked@example.com" UNFLAGGED`,
+		},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			got, err := buildDeleteSearchCriteria(testCase.criteria)
+			if testCase.wantErr != nil {
+				if !errors.Is(err, testCase.wantErr) {
+					t.Fatalf("buildDeleteSearchCriteria() error = %v, want %v", err, testCase.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("buildDeleteSearchCriteria() error = %v", err)
+			}
+			if got != testCase.want {
+				t.Fatalf("buildDeleteSearchCriteria() = %q, want %q", got, testCase.want)
+			}
+		})
+	}
+}
+
 func TestSessionDeleteBefore(t *testing.T) {
 	now := time.Date(2026, time.April, 2, 15, 30, 0, 0, time.UTC)
 	server := newFakeIMAPServer(t, fakeIMAPServerConfig{
@@ -660,6 +716,90 @@ func TestSessionDeleteBefore(t *testing.T) {
 	}
 	if !slices.Equal(remainingSubjects, wantRemainingSubjects) {
 		t.Fatalf("remaining subjects = %v, want %v", remainingSubjects, wantRemainingSubjects)
+	}
+}
+
+func TestSessionDeleteCriteriaDeletesFromAccountsRegardlessAge(t *testing.T) {
+	now := time.Date(2026, time.April, 2, 15, 30, 0, 0, time.UTC)
+	server := newFakeIMAPServer(t, fakeIMAPServerConfig{
+		email:    "user@example.com",
+		password: "correct-password",
+		accept:   true,
+		mailboxes: []fakeIMAPMailbox{
+			{
+				Name: "INBOX",
+				Messages: []fakeIMAPMessage{
+					{
+						UID:        101,
+						MessageID:  "<old@example.com>",
+						ReceivedAt: time.Date(2026, time.January, 1, 8, 0, 0, 0, time.UTC),
+						Subject:    "Old message",
+						From:       "alerts@example.com",
+						To:         "user@example.com",
+					},
+					{
+						UID:        102,
+						MessageID:  "<blocked-new@example.com>",
+						ReceivedAt: time.Date(2026, time.April, 1, 8, 0, 0, 0, time.UTC),
+						Subject:    "Blocked newer message",
+						From:       "Blocked Sender <blocked@example.com>",
+						To:         "user@example.com",
+					},
+					{
+						UID:        103,
+						MessageID:  "<newer@example.com>",
+						ReceivedAt: time.Date(2026, time.April, 1, 9, 0, 0, 0, time.UTC),
+						Subject:    "Newer message",
+						From:       "news@example.com",
+						To:         "user@example.com",
+					},
+				},
+			},
+		},
+	})
+	t.Cleanup(server.Close)
+
+	client := &Client{
+		config: Config{
+			Address:   server.Address(),
+			Email:     "user@example.com",
+			Password:  "correct-password",
+			TLSConfig: server.ClientTLSConfig(),
+		},
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	session, err := client.login(ctx)
+	if err != nil {
+		t.Fatalf("Login() error = %v", err)
+	}
+	defer session.Logout()
+
+	result, err := session.deleteCriteriaResult(DeleteCriteria{
+		ReceivedBefore: deleteCutoff(now, 90),
+		FromAccounts:   []string{"blocked@example.com"},
+	})
+	if err != nil {
+		t.Fatalf("deleteCriteriaResult() error = %v", err)
+	}
+
+	deletedSubjects := make([]string, 0, len(result.Deleted))
+	for _, email := range result.Deleted {
+		deletedSubjects = append(deletedSubjects, email.Subject)
+	}
+	wantDeletedSubjects := []string{
+		"Old message",
+		"Blocked newer message",
+	}
+	if !slices.Equal(deletedSubjects, wantDeletedSubjects) {
+		t.Fatalf("deleteCriteriaResult() subjects = %v, want %v", deletedSubjects, wantDeletedSubjects)
+	}
+
+	remainingEmails := readAllMailboxSummariesForTest(t, session)
+	if len(remainingEmails) != 1 || remainingEmails[0].Subject != "Newer message" {
+		t.Fatalf("remaining emails = %v, want only newer non-blocked message", remainingEmails)
 	}
 }
 
@@ -1852,13 +1992,17 @@ func (s *fakeIMAPServer) searchMessagesLocked(mailboxName, criteria string) ([]i
 		matchAll   bool
 		sinceDate  *time.Time
 		beforeDate *time.Time
+		fromValues []string
 		unflagged  bool
+		matchAny   bool
 	)
 
 	for index := 0; index < len(tokens); index++ {
 		switch strings.ToUpper(tokens[index]) {
 		case "ALL":
 			matchAll = true
+		case "OR":
+			matchAny = true
 		case "SINCE":
 			index++
 			if index >= len(tokens) {
@@ -1879,6 +2023,16 @@ func (s *fakeIMAPServer) searchMessagesLocked(mailboxName, criteria string) ([]i
 				return nil, err
 			}
 			beforeDate = &before
+		case "FROM":
+			index++
+			if index >= len(tokens) {
+				return nil, fmt.Errorf("unsupported SEARCH criteria: %s", criteria)
+			}
+			from, err := parseSearchStringValue(tokens[index])
+			if err != nil {
+				return nil, err
+			}
+			fromValues = append(fromValues, from)
 		case "UNFLAGGED":
 			unflagged = true
 		default:
@@ -1886,7 +2040,7 @@ func (s *fakeIMAPServer) searchMessagesLocked(mailboxName, criteria string) ([]i
 		}
 	}
 
-	if !matchAll && sinceDate == nil && beforeDate == nil {
+	if !matchAll && sinceDate == nil && beforeDate == nil && len(fromValues) == 0 {
 		return nil, fmt.Errorf("unsupported SEARCH criteria: %s", criteria)
 	}
 
@@ -1898,17 +2052,55 @@ func (s *fakeIMAPServer) searchMessagesLocked(mailboxName, criteria string) ([]i
 		if unflagged && message.Flagged && !mailbox.IgnoreUnflagged {
 			continue
 		}
-		if sinceDate != nil && startOfDay(message.ReceivedAt).Before(*sinceDate) {
-			continue
-		}
-		if beforeDate != nil && !startOfDay(message.ReceivedAt).Before(*beforeDate) {
-			continue
+
+		if matchAny {
+			matchesAny := matchAll
+			if sinceDate != nil && !startOfDay(message.ReceivedAt).Before(*sinceDate) {
+				matchesAny = true
+			}
+			if beforeDate != nil && startOfDay(message.ReceivedAt).Before(*beforeDate) {
+				matchesAny = true
+			}
+			if matchesFromValues(message.From, fromValues) {
+				matchesAny = true
+			}
+			if !matchesAny {
+				continue
+			}
+		} else {
+			if sinceDate != nil && startOfDay(message.ReceivedAt).Before(*sinceDate) {
+				continue
+			}
+			if beforeDate != nil && !startOfDay(message.ReceivedAt).Before(*beforeDate) {
+				continue
+			}
+			if len(fromValues) > 0 && !matchesFromValues(message.From, fromValues) {
+				continue
+			}
 		}
 
 		sequenceNumbers = append(sequenceNumbers, index+1)
 	}
 
 	return sequenceNumbers, nil
+}
+
+func parseSearchStringValue(value string) (string, error) {
+	if strings.HasPrefix(value, `"`) {
+		return strconv.Unquote(value)
+	}
+
+	return value, nil
+}
+
+func matchesFromValues(from string, values []string) bool {
+	for _, value := range values {
+		if strings.Contains(strings.ToLower(from), strings.ToLower(value)) {
+			return true
+		}
+	}
+
+	return false
 }
 
 func (s *fakeIMAPServer) searchMessageUIDs(mailboxName, criteria string) ([]uint32, error) {

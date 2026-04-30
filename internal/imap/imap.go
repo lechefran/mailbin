@@ -72,6 +72,7 @@ var (
 	ErrIMAPAddressRequired           = errors.New("imap address is required")
 	ErrEmailRequired                 = errors.New("email is required")
 	ErrPasswordRequired              = errors.New("password is required")
+	ErrDeleteCriteriaRequired        = errors.New("delete criteria is required")
 	ErrReceivedBeforeRequired        = errors.New("received before is required")
 	ErrLoginFailed                   = errors.New("login failed")
 	ErrDeleteIncomplete              = errors.New("delete incomplete")
@@ -142,6 +143,11 @@ type MessageSummary struct {
 	Subject        string
 	From           string
 	To             string
+}
+
+type DeleteCriteria struct {
+	ReceivedBefore time.Time
+	FromAccounts   []string
 }
 
 type DeleteResult struct {
@@ -511,7 +517,7 @@ func (s *session) deleteBeforeResult(before time.Time) (DeleteResult, error) {
 		return DeleteResult{}, ErrReceivedBeforeRequired
 	}
 
-	return s.deleteMatchingMessages("BEFORE %s UNFLAGGED", formatIMAPDate(before))
+	return s.deleteCriteriaResult(DeleteCriteria{ReceivedBefore: before})
 }
 
 func (c *Client) DeleteBefore(ctx context.Context, before time.Time) (DeleteResult, error) {
@@ -538,6 +544,97 @@ func (c *Client) DeleteBefore(ctx context.Context, before time.Time) (DeleteResu
 	}
 
 	return result, nil
+}
+
+func (c *Client) Delete(ctx context.Context, criteria DeleteCriteria) (DeleteResult, error) {
+	if c == nil {
+		return DeleteResult{}, ErrClientRequired
+	}
+
+	searchCriteria, err := buildDeleteSearchCriteria(criteria)
+	if err != nil {
+		return DeleteResult{}, err
+	}
+
+	session, err := c.login(ctx)
+	if err != nil {
+		return DeleteResult{}, err
+	}
+
+	result, deleteErr := session.deleteMatchingMessages(searchCriteria)
+	logoutErr := session.Logout()
+
+	if deleteErr != nil {
+		return result, deleteErr
+	}
+	if logoutErr != nil && !isTimeoutError(logoutErr) {
+		return result, logoutErr
+	}
+
+	return result, nil
+}
+
+func (s *session) deleteCriteriaResult(criteria DeleteCriteria) (DeleteResult, error) {
+	searchCriteria, err := buildDeleteSearchCriteria(criteria)
+	if err != nil {
+		return DeleteResult{}, err
+	}
+
+	return s.deleteMatchingMessages(searchCriteria)
+}
+
+func buildDeleteSearchCriteria(criteria DeleteCriteria) (string, error) {
+	var terms []string
+	if !criteria.ReceivedBefore.IsZero() {
+		terms = append(terms, fmt.Sprintf("BEFORE %s", formatIMAPDate(criteria.ReceivedBefore)))
+	}
+
+	for _, account := range normalizeFromAccounts(criteria.FromAccounts) {
+		quotedAccount, err := quoteIMAPString(account)
+		if err != nil {
+			return "", fmt.Errorf("from account %q: %w", account, err)
+		}
+		terms = append(terms, fmt.Sprintf("FROM %s", quotedAccount))
+	}
+
+	if len(terms) == 0 {
+		return "", ErrDeleteCriteriaRequired
+	}
+
+	return buildORSearchTerms(terms) + " UNFLAGGED", nil
+}
+
+func normalizeFromAccounts(accounts []string) []string {
+	normalized := make([]string, 0, len(accounts))
+	seen := make(map[string]struct{}, len(accounts))
+	for _, account := range accounts {
+		account = strings.TrimSpace(account)
+		if account == "" {
+			continue
+		}
+
+		key := strings.ToLower(account)
+		if _, exists := seen[key]; exists {
+			continue
+		}
+		seen[key] = struct{}{}
+		normalized = append(normalized, account)
+	}
+
+	return normalized
+}
+
+func buildORSearchTerms(terms []string) string {
+	if len(terms) == 1 {
+		return terms[0]
+	}
+
+	expression := fmt.Sprintf("OR %s %s", terms[0], terms[1])
+	for _, term := range terms[2:] {
+		expression = fmt.Sprintf("OR %s %s", expression, term)
+	}
+
+	return expression
 }
 
 func (s *session) deleteMatchingMessages(format string, args ...any) (DeleteResult, error) {

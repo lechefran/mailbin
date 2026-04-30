@@ -20,6 +20,8 @@ type DeleteIncompleteError = internalimap.DeleteIncompleteError
 type DeleteCriteria struct {
 	// ReceivedBefore deletes messages strictly before this timestamp.
 	ReceivedBefore time.Time
+	// FromAccounts deletes messages from these sender email accounts regardless of age.
+	FromAccounts []string
 }
 
 // MessageSummary describes a deleted message.
@@ -38,7 +40,9 @@ var (
 	ErrEmailRequired = internalimap.ErrEmailRequired
 	// ErrPasswordRequired indicates that the client configuration is missing a password.
 	ErrPasswordRequired = internalimap.ErrPasswordRequired
-	// ErrReceivedBeforeRequired indicates that delete criteria did not include a cutoff time.
+	// ErrDeleteCriteriaRequired indicates that delete criteria did not include any supported condition.
+	ErrDeleteCriteriaRequired = internalimap.ErrDeleteCriteriaRequired
+	// ErrReceivedBeforeRequired indicates that a delete-before operation did not include a cutoff time.
 	ErrReceivedBeforeRequired = internalimap.ErrReceivedBeforeRequired
 	// ErrLoginFailed indicates that IMAP authentication failed.
 	ErrLoginFailed = internalimap.ErrLoginFailed
@@ -109,9 +113,9 @@ func (c *Client) Delete(ctx context.Context, criteria DeleteCriteria) (DeleteRes
 	if c == nil || c.imap == nil {
 		return DeleteResult{}, ErrClientRequired
 	}
-	if criteria.ReceivedBefore.IsZero() {
-		return DeleteResult{}, ErrReceivedBeforeRequired
-	}
 
-	return c.imap.DeleteBefore(ctx, criteria.ReceivedBefore)
+	return c.imap.Delete(ctx, internalimap.DeleteCriteria{
+		ReceivedBefore: criteria.ReceivedBefore,
+		FromAccounts:   criteria.FromAccounts,
+	})
 }
